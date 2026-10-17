@@ -132,7 +132,7 @@ def bake(icao, path, out):
                 if end == 1: al = L - al
                 touches = any(RW[v] == i for v in nadj[j])
                 if r['w']/2 + 15/NM < cr < 260/NM and -150/NM < al < 600/NM:
-                    cands.append(((0 if HOLD[j] else 1), (0 if touches else 1), al, j))
+                    cands.append(((0 if touches else 1), (0 if HOLD[j] else 1), round(al * 20), j))
                 if r['w']/2 + 15/NM < cr < 260/NM and 0.45*L < al < 0.97*L:
                     excs.append(((0 if touches else 1), al, j))
             if cands: hs[name] = min(cands)[3]

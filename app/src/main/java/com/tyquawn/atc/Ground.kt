@@ -72,7 +72,7 @@ class GroundNet(val ap: Airport) {
     fun nearest(x: Float, y: Float) = nodes.filter { it.kind != TNode.GATE }.minByOrNull { hypot(it.x - x, it.y - y) }!!
 
     /** Dijkstra; runway nodes cost extra so routes avoid needless crossings; never route through gates. */
-    fun route(from: Int, to: Int): List<Int>? {
+    fun route(from: Int, to: Int, blocked: Set<Int> = emptySet()): List<Int>? {
         val n = nodes.size; val d = FloatArray(n) { Float.MAX_VALUE }; val prev = IntArray(n) { -1 }
         val pq = java.util.PriorityQueue<Pair<Float, Int>>(compareBy { it.first })
         d[from] = 0f; pq.add(0f to from)
@@ -82,7 +82,7 @@ class GroundNet(val ap: Airport) {
             if (u == to) break
             for (e in adj[u] ?: emptyList()) {
                 val v = if (e.a == u) e.b else e.a
-                if (v != to && nodes[v].kind == TNode.GATE) continue
+                if (v != to && (nodes[v].kind == TNode.GATE || v in blocked)) continue
                 val nd = du + dist(u, v) + (if (nodes[v].phys >= 0 && nodes[u].phys < 0) 0.4f else 0f)
                 if (nd < d[v]) { d[v] = nd; prev[v] = u; pq.add(nd to v) }
             }

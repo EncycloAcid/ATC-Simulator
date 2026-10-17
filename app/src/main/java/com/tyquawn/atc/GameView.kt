@@ -12,8 +12,8 @@ import kotlin.math.*
 import kotlin.random.Random
 
 const val RADIUS = 40f
-const val TIME_SCALE = 4f
 
+var nextSerial = 0
 enum class Nav { HDG, ROUTE, DIRECT, HOLD }
 enum class G { AIR, GATE, TAXI, HOLD_SHORT, LINEUP, TAKEOFF, ROLLOUT, EXITED, PARKED }
 
@@ -29,6 +29,7 @@ class Plane(val cs: String, val type: String, val arrival: Boolean) {
     var checkedIn = false
     var gs = G.AIR; var gRwy: RwyEnd? = null; var onRwy = false; val path = ArrayList<Int>(); var gNode = -1
     val crossOk = HashSet<Int>(); var crossing = -1; var holdCross = -1
+    val serial = nextSerial++; var waitFor: Plane? = null; var waitT = 0f; var passWith: Plane? = null
     var gate = -1; var held = false; var waiting = false; var clearedTO = false; var parkedT = 0f; var pendingSid = false
     val heavy get() = isHeavy(type)
     val trail = ArrayList<PointF>(); var trailT = 0f
@@ -42,7 +43,7 @@ fun altTxt(a: Float): String { val r = (a / 100).roundToInt() * 100; return if (
 fun hdgTxt(h: Float) = "%03d".format(norm(h).roundToInt().let { if (it == 0) 360 else it })
 
 class GameView(ctx: Context) : View(ctx) {
-    enum class S { TITLE, SELECT, CAREER, ABOUT, PLAY, PAUSE, OVER }
+    enum class S { TITLE, SELECT, CAREER, ABOUT, SETTINGS, PLAY, PAUSE, OVER }
     enum class M { FREE, CAREER, TUTORIAL }
     var state = S.TITLE
     val prefs = ctx.getSharedPreferences("atc", Context.MODE_PRIVATE)
@@ -50,13 +51,25 @@ class GameView(ctx: Context) : View(ctx) {
     val tone = try { ToneGenerator(AudioManager.STREAM_ALARM, 60) } catch (e: Exception) { null }
     val vib = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
     val dp = resources.displayMetrics.density
+    var haptics = prefs.getBoolean("haptics", true)
+    var speedIdx = prefs.getInt("speed", 2)
+    val timeScale get() = listOf(1f, 2f, 4f, 8f)[speedIdx]
+    var metric = prefs.getBoolean("metric", false)
+    var hintSeen = prefs.getBoolean("hint_seen", false)
+    var sfx = prefs.getBoolean("sfx", true)
+    val clickTone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 25) } catch (e: Exception) { null }
+    fun click() { if (sfx) clickTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 40) }
+    fun buzz(ms: Long = 18, amp: Int = 80) { if (haptics) try { vib?.vibrate(VibrationEffect.createOneShot(ms, amp)) } catch (_: Exception) {} }
+    fun altU(ft: Float) = if (metric) "${(ft * 0.3048f).roundToInt()} m" else "${ft.roundToInt()} ft"
+    fun spdU(kt: Float) = if (metric) "${(kt * 1.852f).roundToInt()} km/h" else "${kt.roundToInt()} kt"
 
-    init {
-        for (a in AIRPORTS) if (!LAYOUTS.containsKey(a.icao)) {
+    /** Layouts are parsed off the UI thread at startup; start() waits for the one it needs. */
+    val loader = Thread {
+        for (a in AIRPORTS) synchronized(LAYOUTS) { if (!LAYOUTS.containsKey(a.icao)) {
             val lay = Layout(ctx.assets.open("${a.icao}.txt").bufferedReader().readText())
-            LAYOUTS[a.icao] = lay; a.ends = lay.ends()
-        }
-    }
+            a.ends = lay.ends(); LAYOUTS[a.icao] = lay } }
+    }.also { it.start() }
+    fun ensureLayouts() { if (loader.isAlive) loader.join() }
     var ap: Airport = AIRPORTS[0]
     fun hiKey() = "high_${ap.icao}"
     var high = 0
@@ -96,6 +109,7 @@ class GameView(ctx: Context) : View(ctx) {
 
     // ---------- game setup ----------
     fun start(a: Airport, m: M = mode, lvl: Level? = null) {
+        ensureLayouts()
         ap = a; mode = m; level = lvl; shiftWon = false; high = prefs.getInt(hiKey(), 0)
         traffic = when (m) { M.CAREER -> lvl!!.traffic; M.TUTORIAL -> 0f; else -> listOf(0.7f, 1f, 1.5f)[trafficIdx] }
         gnd = GroundNet(a); sids = buildSids(a); lastDepT.clear(); lastDepHeavy.clear(); groundView = false
@@ -171,7 +185,7 @@ class GameView(ctx: Context) : View(ctx) {
 
     // ---------- simulation ----------
     fun update(dtReal: Float) {
-        val dt = dtReal * TIME_SCALE
+        val dt = dtReal * timeScale
         simT += dt; sweep = norm(sweep + dtReal * 90f)
         if (msgT > 0) msgT -= dtReal
         if (alarmT > 0) alarmT -= dtReal
@@ -210,6 +224,7 @@ class GameView(ctx: Context) : View(ctx) {
             val a = gp[i]; val b = gp[j]
             val d = hypot(a.x - b.x, a.y - b.y)
             val aMov = a.gs == G.TAXI && !a.held && !a.waiting; val bMov = b.gs == G.TAXI && !b.held && !b.waiting
+            if (a.passWith == b || b.passWith == a) continue
             if (d < 0.02f && (aMov || bMov || a.gs == G.TAKEOFF || b.gs == G.TAKEOFF || a.gs == G.ROLLOUT || b.gs == G.ROLLOUT)) { gameOver("Ground collision: ${a.cs} and ${b.cs}"); return }
             if (d < 0.06f && aMov && bMov) { a.conflict = true; b.conflict = true; newConflict = true }
         }
@@ -217,8 +232,8 @@ class GameView(ctx: Context) : View(ctx) {
             score -= dt.roundToInt()
             if (alarmT <= 0) {
                 alarmT = 2f
-                tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 300)
-                try { vib?.vibrate(VibrationEffect.createOneShot(150, 120)) } catch (_: Exception) {}
+                if (sfx) tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 300)
+                buzz(150, 120)
             }
         }
     }
@@ -357,10 +372,20 @@ class GameView(ctx: Context) : View(ctx) {
                 if (p.held || p.path.isEmpty()) { p.spd = 0f; return }
                 val n = gnd.node(p.path[0])
                 val brg = bearing(p.x, p.y, n.x, n.y)
-                p.waiting = planes.any { q -> q != p && q.gs != G.AIR && q.gs != G.TAKEOFF && q.gs != G.ROLLOUT &&
-                    (q.gs != G.TAXI || q.held || q.waiting) && hypot(q.x - p.x, q.y - p.y) < 0.07f &&
-                    abs(angDiff(brg, bearing(p.x, p.y, q.x, q.y))) < 35f }
-                if (p.waiting) { p.spd = 0f; return }
+                p.passWith?.let { if (it.done || it.gs == G.AIR || hypot(it.x - p.x, it.y - p.y) > 0.15f) p.passWith = null }
+                val blocker = planes.firstOrNull { q -> q != p && q.gs != G.AIR && q.gs != G.TAKEOFF && q.gs != G.ROLLOUT && q.gs != G.PARKED &&
+                    p.passWith != q && q.passWith != p && q.waitFor != p &&
+                    hypot(q.x - p.x, q.y - p.y) < 0.07f && abs(angDiff(brg, bearing(p.x, p.y, q.x, q.y))) < 40f &&
+                    (!(q.gs == G.TAXI && !q.held && q.waitFor == null && q.holdCross < 0) || q.serial < p.serial) }
+                p.waiting = blocker != null
+                if (blocker != null) {
+                    if (p.waitFor != blocker) { p.waitFor = blocker; p.waitT = 0f }
+                    p.waitT += dt; p.spd = 0f
+                    val queue = blocker.gs == G.HOLD_SHORT || blocker.gs == G.LINEUP || (blocker.waitFor != null && blocker.waitFor != p)
+                    if (p.waitT > 8f && !queue) giveWay(p, blocker)
+                    return
+                }
+                p.waitFor = null; p.waitT = 0f
                 if (n.phys >= 0 && n.phys != p.crossing && n.phys !in p.crossOk) {
                     if (p.holdCross != n.phys) { p.holdCross = n.phys
                         radio.say(1, "${ap.radio} ground, ${p.cs}, holding short runway ${rwyName(n.phys)}, request crossing.", low = true) }
@@ -404,6 +429,22 @@ class GameView(ctx: Context) : View(ctx) {
             G.PARKED -> { p.parkedT -= dt; if (p.parkedT <= 0) p.done = true }
             else -> { p.spd = 0f }
         }
+    }
+
+    /** Head-on / blocked taxi resolution: reroute around the other aircraft, else let them pass each other. */
+    var giveWays = 0
+    fun giveWay(p: Plane, q: Plane) {
+        p.waitT = 0f; giveWays++
+        val dest = p.path.lastOrNull() ?: return
+        val blocked = gnd.nodes.filter { hypot(it.x - q.x, it.y - q.y) < 0.08f }.map { it.id }.toMutableSet()
+        q.path.firstOrNull()?.let { blocked.add(it) }
+        val start = if (p.gNode >= 0) p.gNode else gnd.nearest(p.x, p.y).id
+        blocked.remove(start); blocked.remove(dest)
+        val r = gnd.route(start, dest, blocked)
+        if (r != null && r.size > 1) {
+            p.path.clear(); p.path.addAll(r); p.waitFor = null
+            radio.say(0, "${p.cs}, give way to ${q.cs}, revised taxi" + (gnd.names(r).takeIf { it.isNotEmpty() }?.let { " via ${it.joinToString(", ")}" } ?: "") + ".", low = true)
+        } else { p.passWith = q; q.passWith = p; p.waitFor = null }
     }
 
     fun arriveNode(p: Plane, n: TNode) {
@@ -458,12 +499,12 @@ class GameView(ctx: Context) : View(ctx) {
         state = S.OVER; radio.stop()
         if (score > high) { high = score; prefs.edit().putInt(hiKey(), high).apply() }
     }
-    fun rankName() = if (career == 0) "Student" else CAREER[min(career, CAREER.size) - 1].rank + if (career >= CAREER.size) " ★" else ""
+    fun rankName() = if (career == 0) "Student" else CAREER[min(career, CAREER.size) - 1].rank + if (career >= CAREER.size) " (all shifts)" else ""
 
     val tutText = listOf(
         "Welcome! Tap the green aircraft BAW117 (lower part of the scope) to select it.",
-        "Turn it toward the blue dashed final: tap ◀/▶ 10° or drag from the plane. Aim to cross the dashed line at about 30°.",
-        "Descend: tap ▼1000 until the target ALT reads 40 (4,000 ft). The pilot reads it back.",
+        "Turn it toward the blue dashed final: use the HEADING arrows or drag outward from the plane. Aim to cross the dashed line at about 30°.",
+        "Descend: tap the ALTITUDE down arrow until the target reads 4,000 ft. The pilot reads it back.",
         "Now tap ILS for the runway whose dashed final it will cross. It will capture the localizer and glideslope.",
         "Good. Watch it land (you can keep vectoring if it misses the final)…",
         "It's rolling out. Tap the GND button (top of the panel) to open the ground view.",
@@ -471,34 +512,37 @@ class GameView(ctx: Context) : View(ctx) {
         "A departure is at a gate. Select it and tap TAXI to an active runway (or tap a yellow hold-short bar).",
         "When it's holding short, tap CLEARED T/O (or LINE UP first). No takeoff while someone's on short final!",
         "Airborne! Tap RADAR to go back. It flies its SID. Select it, tap HOLD @FIX, then tap any fix.",
-        "Tutorial complete! You know select, heading, altitude, ILS, taxi, takeoff and holds. Tap the ✕ to finish.")
-    fun tutorialTick() {
+        "Tutorial complete! You know select, heading, altitude, ILS, taxi, takeoff and holds. Tap the close button to finish.")
+    fun tutDone(i: Int): Boolean {
         val a = tutPlane; val d = tutDep
-        val ok = when (tut) {
-            0 -> sel != null && sel == a
-            1 -> a != null && a.nav == Nav.HDG && abs(angDiff(a.tHdg, active[0].hdg)) > 5f
-            2 -> a != null && a.tAlt <= 4000f
-            3 -> a != null && a.ils != null
-            4 -> a != null && a.gs != G.AIR
-            5 -> groundView
-            6 -> a != null && (a.gs == G.TAXI && a.path.isNotEmpty() && gnd.node(a.path.last()).kind == TNode.GATE || a.gs == G.PARKED || a.done)
-            7 -> d != null && (d.gs == G.TAXI || d.gs == G.HOLD_SHORT)
+        val down = a != null && a.gs != G.AIR
+        return when (i) {
+            0 -> (a != null && sel == a) || down || a?.ils != null
+            1 -> a != null && ((a.nav == Nav.HDG && abs(angDiff(a.tHdg, active[0].hdg)) > 5f) || a.ils != null || down)
+            2 -> a != null && (a.tAlt <= 4000f || down)
+            3 -> a != null && (a.ils != null || down)
+            4 -> down
+            5 -> groundView || (a != null && (a.gs == G.PARKED || a.done))
+            6 -> a != null && ((a.gs == G.TAXI && a.path.isNotEmpty() && gnd.node(a.path.last()).kind == TNode.GATE) || a.gs == G.PARKED || a.done)
+            7 -> d != null && d.gs != G.GATE && d.gs != G.EXITED
             8 -> d != null && (d.gs == G.TAKEOFF || d.gs == G.AIR)
             9 -> d != null && d.nav == Nav.HOLD
             else -> false
         }
-        if (a != null && a.done && tut <= 4 && a.gs == G.AIR) { tutPlane = null; spawnTutorialArrival() }
-        if (ok) {
-            tut++
-            if (tut == 7) tutDep = spawnDeparture()
-            tone?.startTone(ToneGenerator.TONE_PROP_ACK, 120)
-        }
+    }
+    fun tutorialTick() {
+        val a = tutPlane
+        if (a != null && a.done && a.gs == G.AIR) { tutPlane = null; spawnTutorialArrival() }
+        var adv = false
+        while (tut < tutText.size - 1 && tutDone(tut)) { tut++; adv = true }
+        if (tut >= 7 && tutDep == null) tutDep = spawnDeparture()
+        if (adv) { if (sfx) tone?.startTone(ToneGenerator.TONE_PROP_ACK, 120); buzz(30, 120) }
     }
 
     fun gameOver(r: String) {
         overReason = r; state = S.OVER; radio.stop()
-        tone?.startTone(ToneGenerator.TONE_CDMA_ABBR_ALERT, 1000)
-        try { vib?.vibrate(VibrationEffect.createOneShot(600, 255)) } catch (_: Exception) {}
+        if (sfx) tone?.startTone(ToneGenerator.TONE_CDMA_ABBR_ALERT, 800)
+        buzz(600, 255)
         if (score > high) { high = score; prefs.edit().putInt(hiKey(), high).apply() }
     }
 
@@ -532,7 +576,7 @@ class GameView(ctx: Context) : View(ctx) {
         radio.say(0, "${p.cs}, ${ca.joinToString(", ")}.")
         radio.say(1, "${rb.joinToString(", ")}, ${p.cs}.")
     }
-    fun call(p: Plane, atc: String, rb: String) { flushPending(); radio.say(0, "${p.cs}, $atc."); radio.say(1, "$rb, ${p.cs}.") }
+    fun call(p: Plane, atc: String, rb: String) { flushPending(); click(); buzz(); radio.say(0, "${p.cs}, $atc."); radio.say(1, "$rb, ${p.cs}.") }
 
     // ---------- drawing ----------
     fun sx(x: Float) = cx + (x - ox) * scale
@@ -545,7 +589,7 @@ class GameView(ctx: Context) : View(ctx) {
     val sansBold = Typeface.create("sans-serif", Typeface.BOLD)
     var lastState = S.TITLE; var stateT = 0f; var sheetAnim = 0f; var sheetCollapsed = false
     var pressedId: String? = null; var pressT = 0f
-    var sheetRect = RectF()
+    var sheetRect = RectF(); var sheetScroll = 0f; var sheetMax = 0f
 
     override fun onDraw(c: Canvas) {
         val now = System.nanoTime()
@@ -553,7 +597,7 @@ class GameView(ctx: Context) : View(ctx) {
         lastFrame = now
         if (state != lastState) { lastState = state; stateT = 0f }
         stateT += dt; if (pressT > 0) pressT -= dt
-        if (state == S.PLAY) update(dt) else sweep = norm(sweep + dt * 90f)
+        if (state == S.PLAY && (hintSeen || mode == M.TUTORIAL)) update(dt) else sweep = norm(sweep + dt * 90f)
         val w = width.toFloat(); val h = height.toFloat(); val landscape = w > h
         val inGame = state == S.PLAY || state == S.PAUSE || state == S.OVER
         val want = if (inGame && (sel != null || groundView)) 1f else 0f
@@ -577,10 +621,11 @@ class GameView(ctx: Context) : View(ctx) {
             S.SELECT -> fade(c) { drawSelect(c, w, h) }
             S.CAREER -> fade(c) { drawCareer(c, w, h) }
             S.ABOUT -> fade(c) { drawAbout(c, w, h) }
+            S.SETTINGS -> fade(c) { drawSettings(c, w, h) }
             S.PLAY, S.PAUSE -> {
                 drawPlanes(c); drawHud(c, w, h)
                 if (sheetAnim > 0.01f) drawSheet(c, w, h, landscape, sheetW, sheetH)
-                if (mode == M.TUTORIAL) drawTutorial(c)
+                if (mode == M.TUTORIAL) drawTutorial(c) else if (!hintSeen && state == S.PLAY) drawHint(c, w, h)
                 if (state == S.PAUSE) fade(c) { drawPause(c, w, h) }
             }
             S.OVER -> { drawPlanes(c); fade(c) { drawOver(c, w, h) } }
@@ -590,15 +635,20 @@ class GameView(ctx: Context) : View(ctx) {
 
     inline fun fade(c: Canvas, block: () -> Unit) {
         val a = min(1f, stateT * 5f)
+        if (a >= 1f) { block(); return }
         val sc = c.saveLayerAlpha(null, (a * 255).toInt())
         c.translate(0f, (1f - a) * 24 * dp); block(); c.restoreToCount(sc)
     }
 
     fun glow(p: Paint, col: Int, r: Float) { p.setShadowLayer(r * dp, 0f, 0f, col) }
 
+    var shKey = -1f; var radShader: Shader? = null; var swShader: Shader? = null; val swPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     fun drawScope(c: Canvas) {
         val r = RADIUS * scale
-        pFill.shader = RadialGradient(cx, cy, r, intArrayOf(Color.rgb(8, 46, 20), Color.rgb(4, 28, 12), Color.rgb(2, 14, 6)), floatArrayOf(0f, 0.7f, 1f), Shader.TileMode.CLAMP)
+        if (shKey != cx + cy * 7 + r * 13) { shKey = cx + cy * 7 + r * 13
+            radShader = RadialGradient(cx, cy, r, intArrayOf(Color.rgb(8, 46, 20), Color.rgb(4, 28, 12), Color.rgb(2, 14, 6)), floatArrayOf(0f, 0.7f, 1f), Shader.TileMode.CLAMP)
+            swShader = SweepGradient(cx, cy, intArrayOf(Color.TRANSPARENT, Color.TRANSPARENT, Color.argb(70, 60, 255, 120)), floatArrayOf(0f, 0.85f, 1f)) }
+        pFill.shader = radShader
         c.drawCircle(cx, cy, r, pFill); pFill.shader = null
         pLine.strokeWidth = 1f * dp; pLine.color = Color.argb(90, 60, 220, 100); pLine.clearShadowLayer()
         for (i in 1..4) c.drawCircle(cx, cy, r * i / 4f, pLine)
@@ -614,8 +664,7 @@ class GameView(ctx: Context) : View(ctx) {
         pText.textSize = 9 * dp; pText.color = Color.argb(130, 80, 230, 120); pText.textAlign = Paint.Align.LEFT
         for (i in 1..4) c.drawText("${(RADIUS * i / 4).toInt()}", cx + 3 * dp, cy - r * i / 4f + 11 * dp, pText)
         // sweep
-        val sw = Paint(Paint.ANTI_ALIAS_FLAG)
-        sw.shader = SweepGradient(cx, cy, intArrayOf(Color.TRANSPARENT, Color.TRANSPARENT, Color.argb(70, 60, 255, 120)), floatArrayOf(0f, 0.85f, 1f))
+        val sw = swPaint; sw.shader = swShader
         c.save(); c.rotate(sweep - 90f, cx, cy); c.drawCircle(cx, cy, r, sw); c.restore()
         val sr = Math.toRadians(sweep.toDouble())
         pLine.color = Color.argb(220, 150, 255, 170); pLine.strokeWidth = 1.5f * dp; glow(pLine, Color.argb(200, 60, 255, 120), 5f)
@@ -800,34 +849,39 @@ class GameView(ctx: Context) : View(ctx) {
         pText.textAlign = Paint.Align.LEFT; pText.typeface = cond
     }
     fun iconBtn(c: Canvas, x: Float, y: Float, icon: String, id: String, on: Boolean = false, badge: Int = 0) {
-        val r = RectF(x, y, x + 44 * dp, y + 44 * dp)
+        val r = RectF(x, y, x + 48 * dp, y + 48 * dp)
         val k = if (pressedId == id && pressT > 0) 0.92f else 1f
         c.save(); c.scale(k, k, r.centerX(), r.centerY())
-        card(c, r, 22 * dp, if (on) ACC else SURF)
-        txt(c, icon, r.centerX(), r.centerY() + 6 * dp, 16 * dp, if (on) BG else TXT, sansBold, Paint.Align.CENTER)
+        card(c, r, 24 * dp, if (on) ACC else SURF)
+        Icons.draw(c, icon, r.centerX(), r.centerY(), 20 * dp, if (on) BG else TXT)
         if (badge > 0) { pFill.color = WARN; c.drawCircle(r.right - 6 * dp, r.top + 6 * dp, 9 * dp, pFill)
             txt(c, "$badge", r.right - 6 * dp, r.top + 9.5f * dp, 10 * dp, BG, sansBold, Paint.Align.CENTER) }
-        c.restore(); btns.add(r to id)
+        c.restore(); addBtn(r, id)
     }
+    var clip: RectF? = null
+    fun addBtn(r: RectF, id: String) { val cl = clip; if (cl == null || RectF.intersects(cl, r)) btns.add(RectF(r).also { if (cl != null) it.intersect(cl) } to id) }
 
     fun drawHud(c: Canvas, w: Float, h: Float) {
         val m = 10 * dp
         // score pill
-        val pillW = min(panelX - 3 * 54 * dp - 2 * m, 360 * dp)
-        val pill = RectF(m, m, m + pillW, m + 44 * dp); card(c, pill, 22 * dp)
-        txt(c, "$score", pill.left + 16 * dp, pill.top + 29 * dp, 20 * dp, ACC, sansBold)
+        val pillW = min(panelX - 3 * 56 * dp - 2 * m, 360 * dp)
+        val pill = RectF(m, m, m + pillW, m + 48 * dp); card(c, pill, 24 * dp)
+        txt(c, "$score", pill.left + 16 * dp, pill.top + 31 * dp, 20 * dp, ACC, sansBold)
         val sw = pText.apply { typeface = sansBold; textSize = 20 * dp }.measureText("$score")
-        val sub = level?.let { "LDG $landed/${it.land} · OUT $exited/${it.out} · ${max(0, it.minutes - (simT / 60).toInt())}m left" }
+        pText.typeface = sansMed; pText.textSize = 11.5f * dp
+        val subRaw = level?.let { "LDG $landed/${it.land} · OUT $exited/${it.out} · ${max(0, it.minutes - (simT / 60).toInt())}m left" }
             ?: "${ap.icao} · LDG $landed · OUT $exited · HI $high"
-        txt(c, sub, pill.left + 26 * dp + sw, pill.top + 27 * dp, 11.5f * dp, MUTED, sansMed)
+        var sub = subRaw; val subMax = pillW - 40 * dp - sw
+        if (pText.measureText(sub) > subMax) { while (sub.length > 3 && pText.measureText("$sub…") > subMax) sub = sub.dropLast(1); sub = sub.trimEnd() + "…" }
+        txt(c, sub, pill.left + 26 * dp + sw, pill.top + 29 * dp, 11.5f * dp, MUTED, sansMed)
         // icon buttons
         val gNeed = planes.count { it.gs == G.GATE || it.gs == G.HOLD_SHORT || it.gs == G.EXITED || it.holdCross >= 0 }
         var bx = panelX - m - 44 * dp
-        iconBtn(c, bx, m, "II", "pause"); bx -= 52 * dp
-        iconBtn(c, bx, m, if (groundView) "◎" else "▦", "gnd", groundView, if (groundView) 0 else gNeed); bx -= 52 * dp
-        iconBtn(c, bx, m, if (radio.voice) "🔊" else "🔇", "voice", false)
+        iconBtn(c, bx, m, "pause", "pause"); bx -= 56 * dp
+        iconBtn(c, bx, m, if (groundView) "radar" else "ground", "gnd", groundView, if (groundView) 0 else gNeed); bx -= 56 * dp
+        iconBtn(c, bx, m, if (radio.voice) "speaker" else "mute", "voice", false)
         // wind chip
-        val wr = RectF(panelX - m - 150 * dp, m + 52 * dp, panelX - m, m + 52 * dp + 34 * dp); card(c, wr, 17 * dp)
+        val wr = RectF(panelX - m - 160 * dp, m + 56 * dp, panelX - m, m + 56 * dp + 34 * dp); card(c, wr, 17 * dp)
         val ar = Math.toRadians((windDir + 180f).toDouble()); val ax = wr.left + 18 * dp; val ay = wr.centerY(); val L = 8 * dp
         pLine.color = ACC; pLine.strokeWidth = 2 * dp
         c.drawLine(ax - sin(ar).toFloat() * L, ay + cos(ar).toFloat() * L, ax + sin(ar).toFloat() * L, ay - cos(ar).toFloat() * L, pLine)
@@ -845,7 +899,7 @@ class GameView(ctx: Context) : View(ctx) {
                 val y = tr.top + (19 + 15 * i) * dp
                 txt(c, tag, tr.left + 12 * dp, y, 9.5f * dp, col, sansBold)
                 pText.typeface = sans; pText.textSize = 11 * dp
-                var t = l.text; while (pText.measureText(t) > tw - 56 * dp && t.length > 4) t = t.dropLast(2)
+                var t = l.text; if (pText.measureText(t) > tw - 56 * dp) { while (pText.measureText(t + "…") > tw - 56 * dp && t.length > 4) t = t.dropLast(1); t = t.trimEnd() + "…" }
                 txt(c, t, tr.left + 44 * dp, y, 11 * dp, if (i == lines.size - 1) TXT else MUTED)
             }
         }
@@ -871,10 +925,18 @@ class GameView(ctx: Context) : View(ctx) {
         c.drawRoundRect(r, rad, rad, pFill); pFill.clearShadowLayer()
         if (style == 2) { pLine.color = ACC; pLine.strokeWidth = 1.5f * dp; c.drawRoundRect(r, rad, rad, pLine) }
         val fg = when { !enabled -> MUTED; style == 1 -> BG; style == 2 -> ACC; style == 3 -> Color.rgb(255, 150, 150); else -> TXT }
-        pText.typeface = sansMed; pText.textSize = min(14 * dp, r.height() * 0.36f)
-        while (pText.measureText(label) > r.width() - 10 * dp && pText.textSize > 8 * dp) pText.textSize -= 0.5f * dp
-        txt(c, label, r.centerX(), r.centerY() + pText.textSize * 0.36f, pText.textSize, fg, sansMed, Paint.Align.CENTER)
-        c.restore(); btns.add(r to id)
+        var icon: String? = null; var text = label
+        if (label.startsWith("@")) { icon = label.substring(1).substringBefore(' '); text = label.substringAfter(' ', "") }
+        val isz = min(18 * dp, r.height() * 0.42f)
+        pText.typeface = sansMed; pText.textSize = min(14 * dp, r.height() * 0.34f)
+        val avail = r.width() - 14 * dp - (if (icon != null && text.isNotEmpty()) isz + 6 * dp else 0f)
+        while (pText.measureText(text) > avail && pText.textSize > 9 * dp) pText.textSize -= 0.5f * dp
+        val tw = if (text.isEmpty()) 0f else pText.measureText(text)
+        val total = tw + (if (icon != null) isz + (if (text.isNotEmpty()) 6 * dp else 0f) else 0f)
+        var x0 = r.centerX() - total / 2
+        if (icon != null) { Icons.draw(c, icon, x0 + isz / 2, r.centerY(), isz, fg); x0 += isz + 6 * dp }
+        if (text.isNotEmpty()) txt(c, text, x0, r.centerY() + pText.textSize * 0.36f, pText.textSize, fg, sansMed)
+        c.restore(); if (enabled || style != 0) addBtn(r, id) else addBtn(r, id)
     }
 
     // ---------- control sheet ----------
@@ -889,7 +951,7 @@ class GameView(ctx: Context) : View(ctx) {
         // handle / collapse
         val p = sel
         if (landscape) {
-            button(c, RectF(r.left + 10 * dp, r.top + 10 * dp, r.left + 50 * dp, r.top + 50 * dp), if (sheetCollapsed) "‹" else "›", "sheet")
+            button(c, RectF(r.left + 8 * dp, r.top + 8 * dp, r.left + 56 * dp, r.top + 56 * dp), if (sheetCollapsed) "@collapse" else "@expand", "sheet")
             if (sheetCollapsed) { if (p != null) { c.save(); c.rotate(-90f, r.centerX(), r.centerY()); txt(c, p.cs, r.centerX(), r.centerY() + 5 * dp, 14 * dp, ACC, sansBold, Paint.Align.CENTER); c.restore() }; return }
         } else {
             pFill.color = Color.argb(80, 255, 255, 255); c.drawRoundRect(r.centerX() - 20 * dp, r.top + 7 * dp, r.centerX() + 20 * dp, r.top + 11 * dp, 2 * dp, 2 * dp, pFill)
@@ -910,10 +972,14 @@ class GameView(ctx: Context) : View(ctx) {
         txt(c, p.cs, hx, r.top + (if (landscape) 30 else 40) * dp, 18 * dp, TXT, sansBold)
         val chip = if (p.arrival) (p.star?.name ?: "ARR") else "${p.star?.name ?: ""} → ${p.exitFix!!.name} ${altTxt(p.exitAlt)}"
         txt(c, "${p.type}${if (p.heavy) " · HEAVY" else ""} · $chip", hx, r.top + (if (landscape) 47 else 58) * dp, 11 * dp, MUTED, sansMed)
-        button(c, RectF(right - 36 * dp, r.top + (if (landscape) 12 else 18) * dp, right, r.top + (if (landscape) 48 else 54) * dp), "✕", "desel")
+        button(c, RectF(right - 48 * dp, r.top + (if (landscape) 8 else 16) * dp, right, r.top + (if (landscape) 56 else 64) * dp), "@close", "desel")
         y = r.top + (if (landscape) 62 else 70) * dp
         val gap = 8 * dp
-        val bh = if (landscape) min(46 * dp, (r.bottom - y - 14 * dp - gap * 5) / 6) else min(42 * dp, (r.bottom - y - 12 * dp - gap * 4) / 5)
+        val bh = 48 * dp
+        val top0 = y; val cl = RectF(r.left, top0 - 4 * dp, r.right, r.bottom - 8 * dp)
+        c.save(); c.clipRect(cl); clip = cl
+        y -= sheetScroll
+        try {
         fun row(n: Int, i: Int, span: Int = 1): RectF { val cw = (right - left - (n - 1) * gap) / n; return RectF(left + i * (cw + gap), y, left + i * (cw + gap) + cw * span + gap * (span - 1), y + bh) }
         fun stepper(label: String, value: String, now: String, minus: String, plus: String, idM: String, idP: String) {
             pFill.color = Color.argb(60, 0, 0, 0); c.drawRoundRect(RectF(left, y, right, y + bh), 14 * dp, 14 * dp, pFill)
@@ -926,9 +992,9 @@ class GameView(ctx: Context) : View(ctx) {
             y += bh + gap
         }
         if (p.gs == G.AIR) {
-            stepper("HEADING", hdgTxt(p.tHdg) + "°", "now ${hdgTxt(p.hdg)}", "◀ 10", "10 ▶", "h-10", "h+10")
-            stepper("ALTITUDE", "${(p.tAlt / 100).roundToInt()}", "now ${(p.alt / 100).roundToInt()}", "▼", "▲", "a-", "a+")
-            stepper("SPEED", "${p.tSpd.roundToInt()} kt", "now ${p.spd.roundToInt()}", "−", "+", "s-", "s+")
+            stepper("HEADING", hdgTxt(p.tHdg) + "°", "now ${hdgTxt(p.hdg)}", "@left 10", "@right 10", "h-10", "h+10")
+            stepper("ALTITUDE", altU(p.tAlt), "now ${altU(p.alt)}", "@down", "@up", "a-", "a+")
+            stepper("SPEED", spdU(p.tSpd), "now ${spdU(p.spd)}", "@minus", "@plus", "s-", "s+")
             if (p.arrival) {
                 val n = active.size.coerceAtLeast(1)
                 for ((i, e) in active.withIndex()) button(c, row(n, i), "ILS ${e.name}", "ils:${e.name}", if (p.ils == e) 2 else 1)
@@ -969,6 +1035,14 @@ class GameView(ctx: Context) : View(ctx) {
             if (blocked) txt(c, if (shortFinal(ph)) "Traffic on short final" else "Runway occupied", left, y + 10 * dp, 11 * dp, DANGER, sansMed)
             else if (wake > 0) txt(c, "Wake turbulence: wait ${wake}s after the heavy", left, y + 10 * dp, 11 * dp, WARN, sansMed)
         }
+            } finally {
+            c.restore(); clip = null
+            sheetMax = max(0f, (y + sheetScroll) - top0 - cl.height() + 8 * dp)
+            if (sheetScroll > sheetMax) sheetScroll = sheetMax
+            if (sheetMax > 0f) { pFill.color = Color.argb(90, 255, 255, 255)
+                val th = cl.height() * cl.height() / (cl.height() + sheetMax); val ty = cl.top + (cl.height() - th) * (sheetScroll / sheetMax)
+                c.drawRoundRect(r.right - 5 * dp, ty, r.right - 2 * dp, ty + th, 2 * dp, 2 * dp, pFill) }
+        }
     }
 
     // ---------- screens ----------
@@ -987,7 +1061,7 @@ class GameView(ctx: Context) : View(ctx) {
         val lx = if (landscape) w * 0.3f else w / 2; val ly = if (landscape) h * 0.42f else h * 0.22f
         logo(c, lx, ly, 46 * dp)
         txt(c, "Approach Control", lx, ly + 86 * dp, 28 * dp, TXT, sansBold, Paint.Align.CENTER)
-        txt(c, "Radar ATC simulator · v0.4", lx, ly + 110 * dp, 13 * dp, MUTED, sansMed, Paint.Align.CENTER)
+        txt(c, "Radar ATC simulator · v0.5", lx, ly + 110 * dp, 13 * dp, MUTED, sansMed, Paint.Align.CENTER)
         val cw = min(320 * dp, if (landscape) w * 0.42f else w - 40 * dp)
         val x0 = if (landscape) w * 0.72f - cw / 2 else (w - cw) / 2
         var y = if (landscape) h * 0.18f else h * 0.42f
@@ -995,30 +1069,86 @@ class GameView(ctx: Context) : View(ctx) {
         fun menuCard(icon: String, title: String, sub: String, id: String, primary: Boolean) {
             val r = RectF(x0, y, x0 + cw, y + ch); card(c, r, 18 * dp, if (primary) Color.rgb(24, 52, 40) else SURF)
             pFill.color = if (primary) ACC else SURF2; c.drawCircle(r.left + 34 * dp, r.centerY(), 20 * dp, pFill)
-            txt(c, icon, r.left + 34 * dp, r.centerY() + 6 * dp, 16 * dp, if (primary) BG else TXT, sansBold, Paint.Align.CENTER)
+            Icons.draw(c, icon, r.left + 34 * dp, r.centerY(), 18 * dp, if (primary) BG else TXT)
             txt(c, title, r.left + 66 * dp, r.centerY() - 2 * dp, 16 * dp, TXT, sansBold)
             txt(c, sub, r.left + 66 * dp, r.centerY() + 16 * dp, 11.5f * dp, MUTED, sans)
-            txt(c, "›", r.right - 18 * dp, r.centerY() + 7 * dp, 22 * dp, MUTED, sans, Paint.Align.CENTER)
-            btns.add(r to id); y += ch + 12 * dp
+            Icons.draw(c, "chev", r.right - 20 * dp, r.centerY(), 16 * dp, MUTED)
+            addBtn(r, id); y += ch + 12 * dp
         }
-        menuCard("★", "Career", "Rank: ${rankName()} · ${min(career, CAREER.size)}/${CAREER.size} shifts", "tocareer", true)
-        menuCard("✈", "Free play", "Pick an airport and traffic level", "toselect", false)
-        menuCard("?", "Tutorial", "Learn radar, tower and ground step by step", "tutorial", false)
-        button(c, RectF(x0, y, x0 + cw * 0.62f - 4 * dp, y + 44 * dp), if (radio.voice) "🔊  Voice on" else "🔇  Voice off", "voice", if (radio.voice) 2 else 0)
-        button(c, RectF(x0 + cw * 0.62f + 4 * dp, y, x0 + cw, y + 44 * dp), "ⓘ  About", "about", 0)
+        menuCard("star", "Career", "Rank: ${rankName()} · ${min(career, CAREER.size)}/${CAREER.size} shifts", "tocareer", true)
+        menuCard("plane", "Free play", "Pick an airport and traffic level", "toselect", false)
+        menuCard("help", "Tutorial", "Learn radar, tower and ground step by step", "tutorial", false)
+        button(c, RectF(x0, y, x0 + cw / 2 - 4 * dp, y + 48 * dp), "@gear Settings", "settings", 0)
+        button(c, RectF(x0 + cw / 2 + 4 * dp, y, x0 + cw, y + 48 * dp), "@info About", "about", 0)
     }
-    fun backBtn(c: Canvas, id: String) { iconBtn(c, 14 * dp, 14 * dp, "‹", id) }
+    fun backBtn(c: Canvas, id: String) { iconBtn(c, 14 * dp, 14 * dp, "back", id) }
+    fun wrap(t: String, maxW: Float): List<String> {
+        val out = ArrayList<String>(); var cur = ""
+        for (wd in t.split(" ")) { val nx = if (cur.isEmpty()) wd else "$cur $wd"; if (pText.measureText(nx) > maxW && cur.isNotEmpty()) { out.add(cur); cur = wd } else cur = nx }
+        if (cur.isNotEmpty()) out.add(cur); return out
+    }
+    fun drawHint(c: Canvas, w: Float, h: Float) {
+        val lines = listOf("plane" to "Tap an aircraft to select it; the control panel slides in.",
+            "right" to "Drag outward from a selected aircraft to point its heading.",
+            "down" to "Arrivals: descend, line them up with a blue final, clear ILS.",
+            "ground" to "Ground view: pinch to zoom, drag to pan, taxi and clear for takeoff.",
+            "info" to "Keep 3 nm or 1,000 ft between aircraft. Game is paused until you start.")
+        pText.typeface = sansMed; pText.textSize = 12.5f * dp
+        val cw = min(520 * dp, w - 40 * dp)
+        val wrapped = lines.map { (ic, t) -> ic to wrap(t, cw - 90 * dp) }
+        val bodyH = wrapped.sumOf { (it.second.size * 17 + 14).toDouble() }.toFloat() * dp
+        val r = dialog(c, w, h, min(h - 16 * dp, 72 * dp + bodyH + 76 * dp), cw)
+        txt(c, "How to play", r.left + 24 * dp, r.top + 40 * dp, 20 * dp, TXT, sansBold)
+        var y = r.top + 72 * dp
+        for ((ic, ls) in wrapped) {
+            pFill.color = SURF2; c.drawCircle(r.left + 36 * dp, y + 6 * dp, 14 * dp, pFill)
+            Icons.draw(c, ic, r.left + 36 * dp, y + 6 * dp, 14 * dp, ACC)
+            for ((i, l) in ls.withIndex()) txt(c, l, r.left + 62 * dp, y + (10 + 17 * i) * dp, 12.5f * dp, TXT, sansMed)
+            y += (ls.size * 17 + 14) * dp
+        }
+        button(c, RectF(r.left + 24 * dp, r.bottom - 64 * dp, r.right - 24 * dp, r.bottom - 16 * dp), "Got it — start shift", "hintok", 1)
+    }
+    fun drawSettings(c: Canvas, w: Float, h: Float) {
+        scrim(c, w, h, 225); backBtn(c, "totitle")
+        txt(c, "Settings", 76 * dp, 44 * dp, 22 * dp, TXT, sansBold)
+        val cw = min(560 * dp, w - 40 * dp); val x0 = (w - cw) / 2; var y = 80 * dp
+        val stack = cw < 420 * dp
+        val rowH = if (stack) 112 * dp else max(56 * dp, min(66 * dp, (h - 100 * dp) / 5))
+        fun row(title: String, sub: String, opts: List<String>, sel: Int, idp: String) {
+            val r = RectF(x0, y, x0 + cw, y + rowH - 8 * dp); card(c, r, 16 * dp)
+            val ty = if (stack) r.top + 26 * dp else r.centerY() - 2 * dp
+            txt(c, title, r.left + 16 * dp, ty, 14 * dp, TXT, sansBold)
+            pText.typeface = sans; pText.textSize = 11 * dp
+            val subW = if (stack) cw - 32 * dp else cw - 32 * dp - min(84 * dp, (cw * 0.55f) / opts.size) * opts.size
+            var st = sub; if (pText.measureText(st) > subW) { while (st.length > 3 && pText.measureText(st + "…") > subW) st = st.dropLast(1); st = st.trimEnd() + "…" }
+            txt(c, st, r.left + 16 * dp, ty + 17 * dp, 11 * dp, MUTED, sans)
+            val ow = if (stack) (cw - 16 * dp) / opts.size else min(84 * dp, (cw * 0.55f) / opts.size)
+            val bcy = if (stack) r.bottom - 32 * dp else r.centerY()
+            for ((i, o) in opts.withIndex()) {
+                val br = RectF(r.right - 8 * dp - (opts.size - i) * ow, bcy - 24 * dp, r.right - 8 * dp - (opts.size - i - 1) * ow - 4 * dp, bcy + 24 * dp)
+                button(c, br, o, "$idp:$i", if (i == sel) 1 else 0)
+            }
+            y += rowH
+        }
+        row("Voice radio", "Spoken ATC calls and readbacks", listOf("Off", "On"), if (radio.voice) 1 else 0, "set_voice")
+        row("Sound effects", "Clicks, alerts and chimes", listOf("Off", "On"), if (sfx) 1 else 0, "set_sfx")
+        row("Haptics", "Vibration on commands and alerts", listOf("Off", "On"), if (haptics) 1 else 0, "set_hap")
+        row("Game speed", "Simulation time multiplier", listOf("1×", "2×", "4×", "8×"), speedIdx, "set_speed")
+        row("Units", "Altitude & speed in the control panel", listOf("ft/kt", "m/kmh"), if (metric) 1 else 0, "set_units")
+    }
     fun drawAbout(c: Canvas, w: Float, h: Float) {
         scrim(c, w, h, 225); backBtn(c, "totitle")
         txt(c, "About & credits", 70 * dp, 44 * dp, 22 * dp, TXT, sansBold)
         val lines = listOf(
-            "Approach Control v0.4 — radar, tower & ground ATC simulator.", "",
+            "Approach Control v0.5 — radar, tower & ground ATC simulator.", "",
             "Airport layouts (runways, taxiways, aprons, terminals, gates,", "holding positions) for KATL, KJFK, KLAX and EGLL are derived from",
             "OpenStreetMap data, © OpenStreetMap contributors, available under the", "Open Database License (ODbL) 1.0: openstreetmap.org/copyright", "",
             "Geometry was simplified for performance and may be outdated or", "incomplete. Not for real-world navigation.", "",
             "Fix, STAR and SID names are real or real-sounding and simplified.")
         var y = 84 * dp
-        for (l in lines) { txt(c, l, 24 * dp, y, 13 * dp, if (l.contains("OpenStreetMap")) TXT else MUTED, sansMed); y += 19 * dp }
+        pText.typeface = sansMed; pText.textSize = 13 * dp
+        val para = lines.joinToString("\n").replace("\n\n", "\u0000").replace("\n", " ").split("\u0000")
+        for (pp in para) { for (l in wrap(pp.trim(), w - 48 * dp)) { txt(c, l, 24 * dp, y, 13 * dp, if (pp.contains("OpenStreetMap")) TXT else MUTED, sansMed); y += 19 * dp }; y += 10 * dp }
     }
     fun drawSelect(c: Canvas, w: Float, h: Float) {
         scrim(c, w, h, 215); backBtn(c, "totitle")
@@ -1030,7 +1160,7 @@ class GameView(ctx: Context) : View(ctx) {
         for (i in 0..2) {
             val locked = i == 2 && career < 5
             val r = RectF(sx0 + i * segW, 20 * dp, sx0 + (i + 1) * segW - 4 * dp, 52 * dp)
-            button(c, r, (if (locked) "🔒 " else "") + names[i], "traffic:$i", if (trafficIdx == i) 1 else 0, !locked)
+            button(c, r, (if (locked) "@lock " else "") + names[i], "traffic:$i", if (trafficIdx == i) 1 else 0, !locked)
         }
         val n = AIRPORTS.size; val cols = if (w > h) 2 else 1; val rowsN = (n + cols - 1) / cols
         val gap = 14 * dp
@@ -1043,8 +1173,9 @@ class GameView(ctx: Context) : View(ctx) {
             card(c, r, 18 * dp)
             txt(c, a.icao, r.left + 18 * dp, r.top + ch * 0.4f, min(22 * dp, ch * 0.3f), if (locked) MUTED else TXT, sansBold)
             txt(c, a.city, r.left + 18 * dp, r.top + ch * 0.64f, 12 * dp, MUTED, sansMed)
-            txt(c, if (locked) "🔒 Reach career shift ${UNLOCK[a.icao]} to unlock" else "${a.ends.size / 2} runways · best ${prefs.getInt("high_${a.icao}", 0)}", r.left + 18 * dp, r.top + ch * 0.86f, 11 * dp, if (locked) WARN else ACC, sansMed)
-            if (!locked) { txt(c, "›", r.right - 20 * dp, r.centerY() + 8 * dp, 24 * dp, MUTED, sans, Paint.Align.CENTER); btns.add(r to "ap:$i") }
+            if (locked) Icons.draw(c, "lock", r.right - 26 * dp, r.top + 26 * dp, 16 * dp, WARN)
+            txt(c, if (locked) "Complete career shift ${UNLOCK[a.icao]} to unlock" else "${a.ends.size / 2} runways · best ${prefs.getInt("high_${a.icao}", 0)}", r.left + 18 * dp, r.top + ch * 0.86f, 11 * dp, if (locked) WARN else ACC, sansMed)
+            if (!locked) { Icons.draw(c, "chev", r.right - 22 * dp, r.centerY(), 18 * dp, MUTED); addBtn(r, "ap:$i") }
         }
     }
     fun drawCareer(c: Canvas, w: Float, h: Float) {
@@ -1063,15 +1194,16 @@ class GameView(ctx: Context) : View(ctx) {
             val done = i < career; val cur = i == career; val locked = i > career
             card(c, r, 16 * dp, if (cur) Color.rgb(24, 52, 40) else SURF)
             pFill.color = if (done || cur) ACC else SURF2; c.drawCircle(r.left + 26 * dp, r.centerY(), 15 * dp, pFill)
-            txt(c, if (done) "✓" else if (locked) "🔒" else "${i + 1}", r.left + 26 * dp, r.centerY() + 5 * dp, 13 * dp, if (done || cur) BG else MUTED, sansBold, Paint.Align.CENTER)
+            if (done) Icons.draw(c, "check", r.left + 26 * dp, r.centerY(), 16 * dp, BG) else if (locked) Icons.draw(c, "lock", r.left + 26 * dp, r.centerY(), 14 * dp, MUTED)
+            else txt(c, "${i + 1}", r.left + 26 * dp, r.centerY() + 5 * dp, 13 * dp, BG, sansBold, Paint.Align.CENTER)
             txt(c, "${lv.rank} · ${lv.icao}", r.left + 52 * dp, r.centerY() - 3 * dp, min(15 * dp, ch * 0.24f), if (locked) MUTED else TXT, sansBold)
             txt(c, "Land ${lv.land} · hand off ${lv.out} · ${lv.minutes} min · traffic ×${lv.traffic}", r.left + 52 * dp, r.centerY() + 14 * dp, 11 * dp, MUTED, sans)
             if (!locked) btns.add(r to "career:$i")
         }
     }
-    fun dialog(c: Canvas, w: Float, h: Float, ht: Float): RectF {
+    fun dialog(c: Canvas, w: Float, h: Float, ht: Float, cwIn: Float = min(400 * dp, w - 40 * dp)): RectF {
         scrim(c, w, h, 170)
-        val cw = min(400 * dp, w - 40 * dp); val r = RectF((w - cw) / 2, (h - ht) / 2, (w + cw) / 2, (h + ht) / 2)
+        val cw = cwIn; val r = RectF((w - cw) / 2, (h - ht) / 2, (w + cw) / 2, (h + ht) / 2)
         card(c, r, 24 * dp); return r
     }
     fun drawPause(c: Canvas, w: Float, h: Float) {
@@ -1079,15 +1211,15 @@ class GameView(ctx: Context) : View(ctx) {
         txt(c, "Paused", r.centerX(), r.top + 44 * dp, 22 * dp, TXT, sansBold, Paint.Align.CENTER)
         txt(c, "${ap.icao} · score $score", r.centerX(), r.top + 66 * dp, 12 * dp, MUTED, sansMed, Paint.Align.CENTER)
         val bx = RectF(r.left + 24 * dp, r.top + 86 * dp, r.right - 24 * dp, r.top + 132 * dp)
-        button(c, bx, "▶  Resume", "resume", 1); bx.offset(0f, 54 * dp)
-        button(c, RectF(bx.left, bx.top, bx.centerX() - 5 * dp, bx.bottom), "↻  Restart", "again", 0)
+        button(c, bx, "@play Resume", "resume", 1); bx.offset(0f, 56 * dp)
+        button(c, RectF(bx.left, bx.top, bx.centerX() - 5 * dp, bx.bottom), "@restart Restart", "again", 0)
         button(c, RectF(bx.centerX() + 5 * dp, bx.top, bx.right, bx.bottom), "Quit", "quit", 3)
     }
     fun drawOver(c: Canvas, w: Float, h: Float) {
         val r = dialog(c, w, h, 300 * dp)
         val win = shiftWon
         pFill.color = if (win) ACC else DANGER; c.drawCircle(r.centerX(), r.top + 42 * dp, 22 * dp, pFill)
-        txt(c, if (win) "✓" else "!", r.centerX(), r.top + 50 * dp, 22 * dp, BG, sansBold, Paint.Align.CENTER)
+        if (win) Icons.draw(c, "check", r.centerX(), r.top + 42 * dp, 22 * dp, BG) else txt(c, "!", r.centerX(), r.top + 50 * dp, 22 * dp, BG, sansBold, Paint.Align.CENTER)
         txt(c, if (win) "Shift complete" else if (level != null && !overReason.startsWith("Mid") && !overReason.startsWith("Ground")) "Shift over" else "Game over", r.centerX(), r.top + 94 * dp, 22 * dp, TXT, sansBold, Paint.Align.CENTER)
         pText.textSize = 12 * dp; var reason = overReason; while (pText.measureText(reason) > r.width() - 30 * dp && reason.length > 5) reason = reason.dropLast(2)
         txt(c, reason, r.centerX(), r.top + 116 * dp, 12 * dp, MUTED, sansMed, Paint.Align.CENTER)
@@ -1115,16 +1247,18 @@ class GameView(ctx: Context) : View(ctx) {
         val words = t.split(" "); val lines = ArrayList<String>(); var cur = ""
         for (wd in words) { val nx = if (cur.isEmpty()) wd else "$cur $wd"; if (pText.measureText(nx) > tw - 70 * dp) { lines.add(cur); cur = wd } else cur = nx }
         lines.add(cur)
-        val th = (40 + 18 * lines.size) * dp
+        val th = (40 + 18 * lines.size + (if (tut < tutText.size - 1) 44 else 4)) * dp
         val r = RectF(10 * dp, 64 * dp, 10 * dp + tw, 64 * dp + th)
         card(c, r, 18 * dp, Color.argb(245, 20, 44, 34))
         txt(c, "TUTORIAL · STEP ${min(tut + 1, tutText.size)}/${tutText.size}", r.left + 16 * dp, r.top + 22 * dp, 10 * dp, ACC, sansBold)
         for ((i, l) in lines.withIndex()) txt(c, l, r.left + 16 * dp, r.top + (42 + 18 * i) * dp, 13 * dp, TXT, sansMed)
-        button(c, RectF(r.right - 40 * dp, r.top + 8 * dp, r.right - 8 * dp, r.top + 40 * dp), "✕", "quit")
+        button(c, RectF(r.right - 52 * dp, r.top + 4 * dp, r.right - 4 * dp, r.top + 52 * dp), "@close", "quit")
+        if (tut < tutText.size - 1) button(c, RectF(r.right - 104 * dp, r.bottom - 44 * dp, r.right - 10 * dp, r.bottom - 8 * dp), "Skip step", "tutskip")
     }
 
     // ---------- input ----------
     var dragging = false
+    var sheetDown = false; var sdY = 0f; var sLastY = 0f; var sMoved = false
     var gDownX = 0f; var gDownY = 0f; var gLastX = 0f; var gLastY = 0f; var gMoved = false; var gScaled = false
     val scaleDet = android.view.ScaleGestureDetector(ctx, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(d: android.view.ScaleGestureDetector): Boolean {
@@ -1152,8 +1286,9 @@ class GameView(ctx: Context) : View(ctx) {
         val x = e.x; val y = e.y
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                dragging = false
-                for ((r, id) in btns.reversed()) if (r.contains(x, y)) { pressedId = id; pressT = 0.12f; press(id); return true }
+                dragging = false; sheetDown = false
+                if (state == S.PLAY && sheetAnim > 0.5f && sheetRect.contains(x, y)) { sheetDown = true; sdY = y; sLastY = y; sMoved = false; return true }
+                for ((r, id) in btns.reversed()) if (r.contains(x, y)) { pressedId = id; pressT = 0.12f; buzz(10, 60); press(id); return true }
                 if (state != S.PLAY) return true
                 if (sheetAnim > 0.5f && sheetRect.contains(x, y)) return true
                 val s = sel
@@ -1175,7 +1310,11 @@ class GameView(ctx: Context) : View(ctx) {
                 val near = planes.filter { it.gs == G.AIR }.minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
                 if (near != null && hypot(sx(near.x) - x, sy(near.y) - y) < 45 * dp) { if (near != sel) flushPending(); sel = near; sheetCollapsed = false }
             }
-            MotionEvent.ACTION_MOVE -> if (groundView && state == S.PLAY) {
+            MotionEvent.ACTION_MOVE -> if (sheetDown) {
+                if (abs(y - sdY) > 10 * dp) sMoved = true
+                if (sMoved) sheetScroll = (sheetScroll - (y - sLastY)).coerceIn(0f, sheetMax)
+                sLastY = y
+            } else if (groundView && state == S.PLAY) {
                 if (!scaleDet.isInProgress && e.pointerCount == 1) {
                     if (hypot(x - gDownX, y - gDownY) > 10 * dp) gMoved = true
                     if (gMoved) { gPanX -= (x - gLastX) / scale; gPanY += (y - gLastY) / scale }
@@ -1189,6 +1328,9 @@ class GameView(ctx: Context) : View(ctx) {
                 }
             }
             MotionEvent.ACTION_UP -> { dragging = false
+                if (sheetDown) { sheetDown = false
+                    if (!sMoved) for ((r, id) in btns.reversed()) if (r.contains(x, y)) { pressedId = id; pressT = 0.12f; buzz(10, 60); press(id); break }
+                    return true }
                 if (groundView && state == S.PLAY && !gMoved && !gScaled && !(sheetAnim > 0.5f && sheetRect.contains(x, y)) && btns.none { it.first.contains(x, y) }) groundTap(x, y) }
             MotionEvent.ACTION_POINTER_DOWN -> { gScaled = true; gLastX = x; gLastY = y }
         }
@@ -1241,6 +1383,20 @@ class GameView(ctx: Context) : View(ctx) {
             id == "voice" -> { radio.voice = !radio.voice; if (!radio.voice) radio.stop(); prefs.edit().putBoolean("voice", radio.voice).apply(); return }
             id == "gnd" -> { groundView = !groundView; pick = null; gZoom = 1f; gPanX = 0f; gPanY = 0f; return }
             id == "about" -> { state = S.ABOUT; return }
+            id == "settings" -> { state = S.SETTINGS; return }
+            id == "hintok" -> { hintSeen = true; prefs.edit().putBoolean("hint_seen", true).apply(); lastFrame = 0L; return }
+            id == "tutskip" -> { if (tut < tutText.size - 1) tut++; if (tut >= 7 && tutDep == null) tutDep = spawnDeparture(); return }
+            id.startsWith("set_") -> {
+                val v = id.substringAfter(':').toInt(); val e = prefs.edit()
+                when (id.substringBefore(':')) {
+                    "set_voice" -> { radio.voice = v == 1; if (!radio.voice) radio.stop(); e.putBoolean("voice", radio.voice) }
+                    "set_sfx" -> { sfx = v == 1; e.putBoolean("sfx", sfx) }
+                    "set_hap" -> { haptics = v == 1; e.putBoolean("haptics", haptics) }
+                    "set_speed" -> { speedIdx = v; e.putInt("speed", v) }
+                    "set_units" -> { metric = v == 1; e.putBoolean("metric", metric) }
+                }
+                e.apply(); buzz(); return
+            }
             id == "sheet" -> { sheetCollapsed = !sheetCollapsed; return }
             id == "quit" -> { if (score > high && mode != M.TUTORIAL) { high = score; prefs.edit().putInt(hiKey(), high).apply() }; radio.stop(); state = S.TITLE; return }
         }
@@ -1296,7 +1452,7 @@ class GameView(ctx: Context) : View(ctx) {
                 if (wake > 0) { score -= 40; flash("WAKE TURBULENCE: ${wake.roundToInt()}s early -40") }
                 gcall(p, "wind ${hdgTxt(windDir)} at ${windSpd.toInt()}, runway ${e.name}, cleared for takeoff" + (if (wake > 0) ", caution wake turbulence" else ""), "Cleared for takeoff runway ${e.name}")
             }
-            id == "desel" -> { flushPending(); sel = null; pick = null }
+            id == "desel" -> { flushPending(); sel = null; pick = null; sheetScroll = 0f }
         }
     }
 }
