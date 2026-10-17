@@ -44,6 +44,8 @@ class Radio(ctx: Context) {
         fun speakify(t: String): String {
             var s = t
             s = Regex("\\b([A-Z]{3})(\\d{1,4})\\b").replace(s) { m -> (TELEPHONY[m.groupValues[1]] ?: m.groupValues[1]) + " " + digits(m.groupValues[2]) }
+            val nato = mapOf("A" to "Alpha", "B" to "Bravo", "C" to "Charlie", "D" to "Delta", "E" to "Echo", "F" to "Foxtrot", "G" to "Golf", "H" to "Hotel")
+            s = Regex("\\b([A-H])([1-4])?\\b").replace(s) { m -> nato[m.groupValues[1]] + (if (m.groupValues[2].isNotEmpty()) " " + digits(m.groupValues[2]) else "") }
             s = Regex("heading (\\d{3})").replace(s) { "heading " + digits(it.groupValues[1]) }
             s = Regex("(Left|Right|left|right) (\\d{3})\\b").replace(s) { it.groupValues[1] + " " + digits(it.groupValues[2]) }
             s = Regex("FL(\\d{3})").replace(s) { "flight level " + digits(it.groupValues[1]) }
