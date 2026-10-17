@@ -6,7 +6,7 @@ data class Fix(val name: String, val x: Float, val y: Float)
 /** One landing direction of a physical runway. tx,ty = threshold (nm from field), hdg = landing heading, len nm */
 data class RwyEnd(val name: String, val tx: Float, val ty: Float, val hdg: Float, val len: Float)
 data class Star(val name: String, val fixes: List<Fix>, val alts: List<Float>)
-class Airport(val icao: String, val city: String, val radio: String, val ends: List<RwyEnd>,
+class Airport(val icao: String, val city: String, val radio: String, var ends: List<RwyEnd>,
               val stars: List<Star>, val exits: List<Fix>, val other: List<Fix>) {
     val fixes: List<Fix> get() = (stars.flatMap { it.fixes } + exits + other).distinctBy { it.name }
     fun fix(n: String) = fixes.first { it.name == n }

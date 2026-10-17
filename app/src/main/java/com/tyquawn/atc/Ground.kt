@@ -2,78 +2,92 @@ package com.tyquawn.atc
 
 import kotlin.math.*
 
-class TNode(val id: Int, val x: Float, val y: Float, val kind: Int, val label: String, val end: RwyEnd? = null, val phys: Int = -1) {
+class TNode(val id: Int, val x: Float, val y: Float, var kind: Int, var label: String, var end: RwyEnd? = null, val phys: Int = -1) {
     companion object { const val TWY = 0; const val HS = 1; const val GATE = 2; const val APRON = 3; const val EXIT = 4 }
 }
 class TEdge(val a: Int, val b: Int, val name: String)
 
-val APRON_POS = mapOf("KATL" to Pair(0.5f, 0.15f), "KJFK" to Pair(-0.3f, -0.3f), "KLAX" to Pair(0.2f, 0f), "EGLL" to Pair(0f, 0f))
+/** Parsed OpenStreetMap-derived layout (assets/<ICAO>.txt). Data (c) OpenStreetMap contributors, ODbL. */
+class Layout(text: String) {
+    class Rwy(val n1: String, val n2: String, val ax: Float, val ay: Float, val bx: Float, val by: Float, val w: Float, val h: Float)
+    val rwys = ArrayList<Rwy>(); val nx = ArrayList<Float>(); val ny = ArrayList<Float>(); val nr = ArrayList<Int>(); val nh = ArrayList<Boolean>()
+    val edges = ArrayList<Triple<Int, Int, String>>(); val hs = HashMap<String, Int>(); val ex = HashMap<String, Int>()
+    class Gate(val ref: String, val x: Float, val y: Float, val node: Int)
+    val gates = ArrayList<Gate>(); val aprons = ArrayList<FloatArray>(); val terms = ArrayList<FloatArray>()
+    val labels = ArrayList<Triple<String, Float, Float>>()
+    init {
+        for (ln in text.lineSequence()) {
+            if (ln.isBlank() || ln[0] == '#') continue
+            val t = ln.split(' ')
+            when (t[0]) {
+                "R" -> rwys.add(Rwy(t[1], t[2], t[3].toFloat(), t[4].toFloat(), t[5].toFloat(), t[6].toFloat(), t[7].toFloat(), t[8].toFloat()))
+                "N" -> { nx.add(t[1].toFloat()); ny.add(t[2].toFloat()); nr.add(t[3].toInt()); nh.add(t[4] == "1") }
+                "E" -> edges.add(Triple(t[1].toInt(), t[2].toInt(), if (t[3] == "-") "" else t[3]))
+                "H" -> hs[t[1]] = t[2].toInt()
+                "X" -> ex[t[1]] = t[2].toInt()
+                "G" -> gates.add(Gate(t[1], t[2].toFloat(), t[3].toFloat(), t[4].toInt()))
+                "A", "T" -> { val pts = t[1].split(';').flatMap { it.split(',').map { v -> v.toFloat() } }.toFloatArray(); (if (t[0] == "A") aprons else terms).add(pts) }
+                "L" -> labels.add(Triple(t[1], t[2].toFloat(), t[3].toFloat()))
+            }
+        }
+    }
+    fun ends(): List<RwyEnd> = rwys.flatMap { r ->
+        val len = hypot(r.bx - r.ax, r.by - r.ay)
+        listOf(RwyEnd(r.n1, r.ax, r.ay, r.h, len), RwyEnd(r.n2, r.bx, r.by, (r.h + 180f) % 360f, len))
+    }
+}
+val LAYOUTS = HashMap<String, Layout>()
 
 class GroundNet(val ap: Airport) {
+    val lay = LAYOUTS[ap.icao]!!
     val nodes = ArrayList<TNode>(); val edges = ArrayList<TEdge>()
     private val adj = HashMap<Int, MutableList<TEdge>>()
-    val gates = ArrayList<TNode>(); val hs = HashMap<String, TNode>(); val exits = HashMap<Int, TNode>()
-    val apron: TNode
+    val gates = ArrayList<TNode>(); val hs = HashMap<String, TNode>(); val hsEnd = HashMap<Int, RwyEnd>()
+    private val exits = HashMap<String, TNode>()
     var minX = 0f; var maxX = 0f; var minY = 0f; var maxY = 0f
+    val taxiPath = android.graphics.Path(); val apronPath = android.graphics.Path(); val termPath = android.graphics.Path()
 
-    private fun add(x: Float, y: Float, kind: Int, label: String, end: RwyEnd? = null, phys: Int = -1) =
-        TNode(nodes.size, x, y, kind, label, end, phys).also { nodes.add(it) }
-    private fun link(a: TNode, b: TNode, name: String) {
-        val e = TEdge(a.id, b.id, name); edges.add(e)
-        adj.getOrPut(a.id) { mutableListOf() }.add(e); adj.getOrPut(b.id) { mutableListOf() }.add(e)
+    private fun link(a: Int, b: Int, name: String) {
+        val e = TEdge(a, b, name); edges.add(e)
+        adj.getOrPut(a) { mutableListOf() }.add(e); adj.getOrPut(b) { mutableListOf() }.add(e)
     }
-
     init {
-        val (axp, ayp) = APRON_POS[ap.icao] ?: Pair(0f, 0f)
-        apron = add(axp, ayp, TNode.APRON, "RAMP")
-        for (i in 0 until 10) {
-            val a = Math.toRadians(i * 36.0)
-            val g = add(axp + (sin(a) * 0.11).toFloat(), ayp + (cos(a) * 0.11).toFloat(), TNode.GATE, "${i + 1}")
-            gates.add(g); link(g, apron, "ramp")
-        }
-        val nR = ap.ends.size / 2
-        for (k in 0 until nR) {
-            val a = ap.ends[2 * k]; val b = ap.ends[2 * k + 1]
-            val L = ('A' + k).toString()
-            val dx = b.tx - a.tx; val dy = b.ty - a.ty; val len = hypot(dx, dy); val ux = dx / len; val uy = dy / len
-            var nx = -uy; var ny = ux
-            if ((axp - a.tx) * nx + (ayp - a.ty) * ny < 0) { nx = -nx; ny = -ny }
-            val mx = (a.tx + b.tx) / 2; val my = (a.ty + b.ty) / 2
-            val off = 0.17f; val hso = 0.08f
-            val t1 = add(a.tx + nx * off, a.ty + ny * off, TNode.TWY, L)
-            val t2 = add(mx + nx * off, my + ny * off, TNode.TWY, L)
-            val t3 = add(b.tx + nx * off, b.ty + ny * off, TNode.TWY, L)
-            link(t1, t2, L); link(t2, t3, L)
-            val ha = add(a.tx + nx * hso, a.ty + ny * hso, TNode.HS, a.name, a, k); link(ha, t1, "${L}1"); hs[a.name] = ha
-            val hb = add(b.tx + nx * hso, b.ty + ny * hso, TNode.HS, b.name, b, k); link(hb, t3, "${L}3"); hs[b.name] = hb
-            val ex = add(mx + nx * hso, my + ny * hso, TNode.EXIT, "${L}2", null, k); link(ex, t2, "${L}2"); exits[k] = ex
-            link(t2, apron, "${L}4")
-        }
+        for (i in lay.nx.indices) nodes.add(TNode(i, lay.nx[i], lay.ny[i], TNode.TWY, "", null, lay.nr[i]))
+        for ((a, b, n) in lay.edges) { link(a, b, n); taxiPath.moveTo(nodes[a].x, nodes[a].y); taxiPath.lineTo(nodes[b].x, nodes[b].y) }
+        for ((name, id) in lay.hs) { val e = ap.ends.firstOrNull { it.name == name } ?: continue
+            val n = nodes[id]; n.kind = TNode.HS; n.label = name; n.end = e; hs[name] = n; hsEnd[id] = e }
+        for ((name, id) in lay.ex) exits[name] = nodes[id]
+        for (g in lay.gates) { val n = TNode(nodes.size, g.x, g.y, TNode.GATE, g.ref); nodes.add(n); gates.add(n); link(n.id, g.node, "ramp")
+            taxiPath.moveTo(g.x, g.y); taxiPath.lineTo(nodes[g.node].x, nodes[g.node].y) }
+        fun poly(p: android.graphics.Path, a: FloatArray) { p.moveTo(a[0], a[1]); var i = 2; while (i < a.size) { p.lineTo(a[i], a[i + 1]); i += 2 }; p.close() }
+        for (a in lay.aprons) poly(apronPath, a); for (a in lay.terms) poly(termPath, a)
         minX = nodes.minOf { it.x }; maxX = nodes.maxOf { it.x }; minY = nodes.minOf { it.y }; maxY = nodes.maxOf { it.y }
         for (e in ap.ends) { minX = min(minX, e.tx); maxX = max(maxX, e.tx); minY = min(minY, e.ty); maxY = max(maxY, e.ty) }
     }
 
     fun node(id: Int) = nodes[id]
     fun dist(a: Int, b: Int) = hypot(nodes[a].x - nodes[b].x, nodes[a].y - nodes[b].y)
+    fun exitFor(e: RwyEnd, px: Float, py: Float): TNode = exits[e.name]
+        ?: nodes.filter { it.phys < 0 && it.kind != TNode.GATE }.minByOrNull { hypot(it.x - px, it.y - py) }!!
+    fun nearest(x: Float, y: Float) = nodes.filter { it.kind != TNode.GATE }.minByOrNull { hypot(it.x - x, it.y - y) }!!
 
-    /** shortest path from->to inclusive of both */
+    /** Dijkstra; runway nodes cost extra so routes avoid needless crossings; never route through gates. */
     fun route(from: Int, to: Int): List<Int>? {
-        val d = FloatArray(nodes.size) { Float.MAX_VALUE }; val prev = IntArray(nodes.size) { -1 }; val done = BooleanArray(nodes.size)
-        d[from] = 0f
-        while (true) {
-            var u = -1; var best = Float.MAX_VALUE
-            for (i in nodes.indices) if (!done[i] && d[i] < best) { best = d[i]; u = i }
-            if (u < 0) return null
+        val n = nodes.size; val d = FloatArray(n) { Float.MAX_VALUE }; val prev = IntArray(n) { -1 }
+        val pq = java.util.PriorityQueue<Pair<Float, Int>>(compareBy { it.first })
+        d[from] = 0f; pq.add(0f to from)
+        while (pq.isNotEmpty()) {
+            val (du, u) = pq.poll()!!
+            if (du > d[u]) continue
             if (u == to) break
-            done[u] = true
             for (e in adj[u] ?: emptyList()) {
                 val v = if (e.a == u) e.b else e.a
-                // don't route through gates/hold-shorts/exits unless they're the destination
-                if (v != to && nodes[v].kind != TNode.TWY && nodes[v].kind != TNode.APRON) continue
-                val nd = d[u] + dist(u, v)
-                if (nd < d[v]) { d[v] = nd; prev[v] = u }
+                if (v != to && nodes[v].kind == TNode.GATE) continue
+                val nd = du + dist(u, v) + (if (nodes[v].phys >= 0 && nodes[u].phys < 0) 0.4f else 0f)
+                if (nd < d[v]) { d[v] = nd; prev[v] = u; pq.add(nd to v) }
             }
         }
+        if (d[to] == Float.MAX_VALUE) return null
         val out = ArrayList<Int>(); var c = to
         while (c != -1) { out.add(0, c); c = prev[c] }
         return out
@@ -81,7 +95,7 @@ class GroundNet(val ap: Airport) {
     fun edgeName(a: Int, b: Int) = (adj[a] ?: emptyList()).firstOrNull { (it.a == a && it.b == b) || (it.a == b && it.b == a) }?.name
     fun names(path: List<Int>): List<String> {
         val out = ArrayList<String>()
-        for (i in 0 until path.size - 1) { val n = edgeName(path[i], path[i + 1]) ?: continue; if (n != "ramp" && out.lastOrNull() != n) out.add(n) }
+        for (i in 0 until path.size - 1) { val n = edgeName(path[i], path[i + 1]) ?: continue; if (n.isNotEmpty() && n != "ramp" && out.lastOrNull() != n) out.add(n) }
         return out
     }
 }

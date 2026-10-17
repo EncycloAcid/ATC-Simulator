@@ -28,6 +28,7 @@ class Plane(val cs: String, val type: String, val arrival: Boolean) {
     var ils: RwyEnd? = null; var onLoc = false
     var checkedIn = false
     var gs = G.AIR; var gRwy: RwyEnd? = null; var onRwy = false; val path = ArrayList<Int>(); var gNode = -1
+    val crossOk = HashSet<Int>(); var crossing = -1; var holdCross = -1
     var gate = -1; var held = false; var waiting = false; var clearedTO = false; var parkedT = 0f; var pendingSid = false
     val heavy get() = isHeavy(type)
     val trail = ArrayList<PointF>(); var trailT = 0f
@@ -41,7 +42,7 @@ fun altTxt(a: Float): String { val r = (a / 100).roundToInt() * 100; return if (
 fun hdgTxt(h: Float) = "%03d".format(norm(h).roundToInt().let { if (it == 0) 360 else it })
 
 class GameView(ctx: Context) : View(ctx) {
-    enum class S { TITLE, SELECT, CAREER, PLAY, PAUSE, OVER }
+    enum class S { TITLE, SELECT, CAREER, ABOUT, PLAY, PAUSE, OVER }
     enum class M { FREE, CAREER, TUTORIAL }
     var state = S.TITLE
     val prefs = ctx.getSharedPreferences("atc", Context.MODE_PRIVATE)
@@ -50,6 +51,12 @@ class GameView(ctx: Context) : View(ctx) {
     val vib = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
     val dp = resources.displayMetrics.density
 
+    init {
+        for (a in AIRPORTS) if (!LAYOUTS.containsKey(a.icao)) {
+            val lay = Layout(ctx.assets.open("${a.icao}.txt").bufferedReader().readText())
+            LAYOUTS[a.icao] = lay; a.ends = lay.ends()
+        }
+    }
     var ap: Airport = AIRPORTS[0]
     fun hiKey() = "high_${ap.icao}"
     var high = 0
@@ -145,7 +152,7 @@ class GameView(ctx: Context) : View(ctx) {
         val free = freeGates(); if (free.size <= 1) return null
         val gi = free.random(); val g = gnd.gates[gi]
         val cs = callsign(); val p = Plane(cs, acType(cs), false)
-        p.x = g.x; p.y = g.y; p.hdg = bearing(gnd.apron.x, gnd.apron.y, g.x, g.y); p.tHdg = p.hdg
+        p.x = g.x; p.y = g.y; val gn = gnd.nearest(g.x, g.y); p.hdg = bearing(g.x, g.y, gn.x, gn.y); p.tHdg = p.hdg
         p.alt = 0f; p.tAlt = 7000f; p.spd = 0f; p.tSpd = 250f
         p.gs = G.GATE; p.gNode = g.id; p.gate = gi
         p.exitFix = ap.exits.random(); p.exitAlt = (Random.nextInt(10, 18) * 1000).toFloat(); p.star = sids[p.exitFix!!.name]
@@ -262,7 +269,7 @@ class GameView(ctx: Context) : View(ctx) {
                             p.gs = G.ROLLOUT; p.gRwy = ils; p.onRwy = true; p.alt = 0f; p.tAlt = 0f; p.spd = 140f; p.hdg = ils.hdg
                             p.ils = null; p.onLoc = false; p.x = ils.tx; p.y = ils.ty; p.trail.clear()
                             landed++; score += 100; flash("${p.cs} landed ${ils.name} +100")
-                            radio.say(0, "${p.cs}, exit ${gnd.exits[ph]?.label} when able, contact ground.", low = true)
+                            val exn = gnd.exitFor(ils, p.x, p.y); radio.say(0, "${p.cs}, " + (twyAt(exn.id)?.let { "exit $it when able" } ?: "exit when able") + ", contact ground.", low = true)
                         }
                         else -> goAround(p, "unstable")
                     }
@@ -326,7 +333,9 @@ class GameView(ctx: Context) : View(ctx) {
     }
 
     fun physOf(e: RwyEnd) = ap.ends.indexOf(e) / 2
-    fun rwyOccupied(ph: Int, except: Plane?) = planes.any { it != except && it.onRwy && it.gRwy != null && physOf(it.gRwy!!) == ph }
+    fun rwyOccupied(ph: Int, except: Plane?) = planes.any { it != except && ((it.onRwy && it.gRwy != null && physOf(it.gRwy!!) == ph) || (it.gs == G.TAXI && it.crossing == ph)) }
+    fun rwyName(ph: Int): String { val a = ap.ends[2 * ph]; val b = ap.ends[2 * ph + 1]; return if (active.contains(b) && !active.contains(a)) b.name else a.name }
+    fun twyAt(id: Int): String? = gnd.edges.firstOrNull { (it.a == id || it.b == id) && it.name.isNotEmpty() && it.name != "ramp" }?.name
     fun shortFinal(ph: Int) = planes.any { val e = it.ils; it.onLoc && e != null && physOf(e) == ph && hypot(it.x - e.tx, it.y - e.ty) < 3f }
     fun wakeWait(p: Plane, ph: Int): Float {
         val t = lastDepT[ph] ?: return 0f
@@ -352,8 +361,15 @@ class GameView(ctx: Context) : View(ctx) {
                     (q.gs != G.TAXI || q.held || q.waiting) && hypot(q.x - p.x, q.y - p.y) < 0.07f &&
                     abs(angDiff(brg, bearing(p.x, p.y, q.x, q.y))) < 35f }
                 if (p.waiting) { p.spd = 0f; return }
+                if (n.phys >= 0 && n.phys != p.crossing && n.phys !in p.crossOk) {
+                    if (p.holdCross != n.phys) { p.holdCross = n.phys
+                        radio.say(1, "${ap.radio} ground, ${p.cs}, holding short runway ${rwyName(n.phys)}, request crossing.", low = true) }
+                    p.spd = 0f; return
+                }
+                if (n.phys >= 0) { p.crossing = n.phys; p.holdCross = -1 }
                 if (stepToward(p, n.x, n.y, 20f, dt)) {
                     p.gNode = n.id; p.path.removeAt(0)
+                    if (n.phys < 0 && p.crossing >= 0) { p.crossOk.remove(p.crossing); p.crossing = -1 }
                     if (p.path.isEmpty()) arriveNode(p, n)
                 }
             }
@@ -380,7 +396,8 @@ class GameView(ctx: Context) : View(ctx) {
                 val hr = Math.toRadians(p.hdg.toDouble()); val nm = p.spd / 3600f * dt
                 p.x += sin(hr).toFloat() * nm; p.y += cos(hr).toFloat() * nm
                 if (hypot(p.x - e.tx, p.y - e.ty) >= e.len * 0.5f) {
-                    val ex = gnd.exits[physOf(e)]!!
+                    val ex = gnd.exitFor(e, p.x, p.y)
+                    p.crossOk.add(physOf(e)); p.crossing = physOf(e)
                     p.gs = G.TAXI; p.path.clear(); p.path.add(ex.id)
                 }
             }
@@ -391,13 +408,15 @@ class GameView(ctx: Context) : View(ctx) {
 
     fun arriveNode(p: Plane, n: TNode) {
         p.spd = 0f
-        when (n.kind) {
-            TNode.HS -> { p.gs = G.HOLD_SHORT; p.hdg = bearing(p.x, p.y, n.end!!.tx, n.end.ty)
-                radio.say(1, "${ap.radio} tower, ${p.cs}, holding short runway ${n.label}, ready for departure.", low = true) }
-            TNode.EXIT -> { p.gs = G.EXITED; p.onRwy = false
-                radio.say(1, "${ap.radio} ground, ${p.cs}, clear of the runway at ${n.label}, request taxi to the gate.", low = true) }
-            TNode.GATE -> { p.gs = G.PARKED; p.parkedT = 40f; score += 25; flash("${p.cs} parked at gate ${n.label} +25") }
-            else -> { p.gs = G.TAXI }
+        val hsE = gnd.hsEnd[n.id]
+        when {
+            n.kind == TNode.GATE -> { p.gs = G.PARKED; p.parkedT = 40f; score += 25; flash("${p.cs} parked at gate ${n.label} +25") }
+            !p.arrival && hsE != null -> { p.gs = G.HOLD_SHORT; p.hdg = bearing(p.x, p.y, hsE.tx, hsE.ty)
+                radio.say(1, "${ap.radio} tower, ${p.cs}, holding short runway ${hsE.name}, ready for departure.", low = true) }
+            p.arrival && p.onRwy -> { p.gs = G.EXITED; p.onRwy = false; p.crossing = -1
+                radio.say(1, "${ap.radio} ground, ${p.cs}, clear of the runway" + (twyAt(n.id)?.let { " at $it" } ?: "") + ", request taxi to the gate.", low = true) }
+            p.arrival -> p.gs = G.EXITED
+            else -> p.gs = G.EXITED
         }
     }
 
@@ -448,7 +467,7 @@ class GameView(ctx: Context) : View(ctx) {
         "Now tap ILS for the runway whose dashed final it will cross. It will capture the localizer and glideslope.",
         "Good. Watch it land (you can keep vectoring if it misses the final)…",
         "It's rolling out. Tap the GND button (top of the panel) to open the ground view.",
-        "When it's clear of the runway, select it and tap TAXI GATE. Arrivals park at gates.",
+        "Pinch to zoom, drag to pan. When it's clear of the runway, select it and tap TAXI TO GATE: the route uses real Heathrow taxiways.",
         "A departure is at a gate. Select it and tap TAXI to an active runway (or tap a yellow hold-short bar).",
         "When it's holding short, tap CLEARED T/O (or LINE UP first). No takeoff while someone's on short final!",
         "Airborne! Tap RADAR to go back. It flies its SID. Select it, tap HOLD @FIX, then tap any fix.",
@@ -547,7 +566,8 @@ class GameView(ctx: Context) : View(ctx) {
         cx = panelX / 2f; cy = scopeH / 2f + (if (inGame) 16 * dp else 0f)
         if (groundView && inGame) {
             ox = (gnd.minX + gnd.maxX) / 2; oy = (gnd.minY + gnd.maxY) / 2
-            scale = min(panelX / (gnd.maxX - gnd.minX + 0.6f), (scopeH - 130 * dp) / (gnd.maxY - gnd.minY + 0.6f))
+            scale = min(panelX / (gnd.maxX - gnd.minX + 0.3f), (scopeH - 130 * dp) / (gnd.maxY - gnd.minY + 0.3f)) * gZoom
+            ox += gPanX; oy += gPanY
         } else { ox = 0f; oy = 0f; scale = min(panelX, scopeH - (if (inGame) 40 * dp else 0f)) / 2f / RADIUS * 0.97f }
         c.drawColor(BG)
         if (groundView && inGame) drawGround(c) else drawScope(c)
@@ -556,6 +576,7 @@ class GameView(ctx: Context) : View(ctx) {
             S.TITLE -> fade(c) { drawTitle(c, w, h) }
             S.SELECT -> fade(c) { drawSelect(c, w, h) }
             S.CAREER -> fade(c) { drawCareer(c, w, h) }
+            S.ABOUT -> fade(c) { drawAbout(c, w, h) }
             S.PLAY, S.PAUSE -> {
                 drawPlanes(c); drawHud(c, w, h)
                 if (sheetAnim > 0.01f) drawSheet(c, w, h, landscape, sheetW, sheetH)
@@ -686,69 +707,71 @@ class GameView(ctx: Context) : View(ctx) {
         }
     }
     // ---------- ground view ----------
+    var gZoom = 1f; var gPanX = 0f; var gPanY = 0f
     fun drawGround(c: Canvas) {
-        pFill.shader = RadialGradient(cx, cy, max(width, height).toFloat(), Color.rgb(16, 26, 22), BG, Shader.TileMode.CLAMP)
-        c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), pFill); pFill.shader = null
-        // grass grid
-        pLine.color = Color.argb(18, 120, 255, 170); pLine.strokeWidth = 1f
-        var gx = sx(ox) % (scale * 0.25f); while (gx < panelX) { c.drawLine(gx, 0f, gx, scopeH, pLine); gx += scale * 0.25f }
-        // runways
+        c.drawColor(Color.rgb(14, 22, 18))
+        val inv = 1f / scale
+        c.save(); c.translate(cx, cy); c.scale(scale, -scale); c.translate(-ox, -oy)
+        pFill.color = Color.rgb(40, 46, 52); c.drawPath(gnd.apronPath, pFill)
+        pFill.color = Color.rgb(58, 74, 92); c.drawPath(gnd.termPath, pFill)
+        pLine.strokeCap = Paint.Cap.BUTT
         for (k in 0 until ap.ends.size / 2) {
-            val a = ap.ends[2 * k]; val b = ap.ends[2 * k + 1]
-            pLine.color = Color.rgb(58, 64, 72); pLine.strokeWidth = max(10 * dp, 0.06f * scale); pLine.strokeCap = Paint.Cap.BUTT
-            c.drawLine(sx(a.tx), sy(a.ty), sx(b.tx), sy(b.ty), pLine)
-            pLine.color = Color.argb(200, 240, 240, 240); pLine.strokeWidth = 1.2f * dp
-            pLine.pathEffect = DashPathEffect(floatArrayOf(8 * dp, 7 * dp), 0f)
-            c.drawLine(sx(a.tx), sy(a.ty), sx(b.tx), sy(b.ty), pLine); pLine.pathEffect = null; pLine.strokeCap = Paint.Cap.ROUND
-            for (e in listOf(a, b)) {
-                val act = active.contains(e)
-                pText.typeface = sansBold; pText.textSize = 11 * dp; pText.textAlign = Paint.Align.CENTER
-                val rh = Math.toRadians(e.hdg.toDouble())
-                val lx = sx(e.tx - sin(rh).toFloat() * 0.12f); val ly = sy(e.ty - cos(rh).toFloat() * 0.12f)
-                pFill.color = if (act) ACC else SURF2; c.drawRoundRect(lx - 16 * dp, ly - 9 * dp, lx + 16 * dp, ly + 9 * dp, 9 * dp, 9 * dp, pFill)
-                pText.color = if (act) BG else TXT; c.drawText(e.name, lx, ly + 4 * dp, pText)
-            }
+            val a = ap.ends[2 * k]; val b = ap.ends[2 * k + 1]; val r = gnd.lay.rwys[k]
+            pLine.color = Color.rgb(70, 76, 84); pLine.strokeWidth = max(r.w, 5f * dp * inv)
+            c.drawLine(a.tx, a.ty, b.tx, b.ty, pLine)
+            pLine.color = Color.argb(210, 240, 240, 240); pLine.strokeWidth = max(0.002f, 1f * dp * inv)
+            pLine.pathEffect = DashPathEffect(floatArrayOf(0.02f, 0.015f), 0f); c.drawLine(a.tx, a.ty, b.tx, b.ty, pLine); pLine.pathEffect = null
         }
-        // taxiways
-        for (e in gnd.edges) {
-            val a = gnd.node(e.a); val b = gnd.node(e.b)
-            pLine.color = if (e.name == "ramp") Color.argb(120, 230, 200, 80) else Color.rgb(214, 180, 60)
-            pLine.strokeWidth = (if (e.name == "ramp") 1.5f else 2.5f) * dp
-            c.drawLine(sx(a.x), sy(a.y), sx(b.x), sy(b.y), pLine)
-            if (e.name != "ramp" && hypot(sx(a.x) - sx(b.x), sy(a.y) - sy(b.y)) > 28 * dp) {
-                val mx = (sx(a.x) + sx(b.x)) / 2; val my = (sy(a.y) + sy(b.y)) / 2
-                pFill.color = Color.rgb(20, 20, 20); c.drawRoundRect(mx - 11 * dp, my - 7 * dp, mx + 11 * dp, my + 7 * dp, 3 * dp, 3 * dp, pFill)
-                pText.typeface = sansBold; pText.textSize = 9 * dp; pText.color = Color.rgb(255, 210, 70); pText.textAlign = Paint.Align.CENTER
-                c.drawText(e.name, mx, my + 3 * dp, pText)
-            }
+        pLine.strokeCap = Paint.Cap.ROUND
+        pLine.color = Color.rgb(205, 170, 55); pLine.strokeWidth = max(0.008f, 1.6f * dp * inv); c.drawPath(gnd.taxiPath, pLine)
+        c.restore()
+        // runway end chips
+        for (e in ap.ends) {
+            val act = active.contains(e); val rh = Math.toRadians(e.hdg.toDouble())
+            val lx = sx(e.tx - sin(rh).toFloat() * 0.08f); val ly = sy(e.ty - cos(rh).toFloat() * 0.08f)
+            pFill.color = if (act) ACC else SURF2; c.drawRoundRect(lx - 17 * dp, ly - 9 * dp, lx + 17 * dp, ly + 9 * dp, 9 * dp, 9 * dp, pFill)
+            txt(c, e.name, lx, ly + 4 * dp, 11 * dp, if (act) BG else TXT, sansBold, Paint.Align.CENTER)
         }
-        // apron + gates
-        pFill.color = Color.argb(60, 160, 170, 180); c.drawCircle(sx(gnd.apron.x), sy(gnd.apron.y), 0.16f * scale, pFill)
-        for ((i, g) in gnd.gates.withIndex()) {
-            val occ = planes.any { it.gate == i }
-            val gx2 = sx(g.x); val gy = sy(g.y); val r = 9 * dp
-            pFill.color = if (occ) SURF2 else Color.rgb(44, 56, 66); c.drawRoundRect(gx2 - r, gy - r, gx2 + r, gy + r, 4 * dp, 4 * dp, pFill)
-            pText.typeface = sansMed; pText.textSize = 9 * dp; pText.color = if (occ) MUTED else TXT; pText.textAlign = Paint.Align.CENTER
-            c.drawText(g.label, gx2, gy + 3 * dp, pText)
+        // taxiway labels (decluttered in screen space)
+        val placed = ArrayList<RectF>()
+        if (scale * 0.12f > 14 * dp) for ((n, x, y) in gnd.lay.labels) {
+            val px = sx(x); val py = sy(y); if (px < 0 || px > panelX || py < 0 || py > scopeH) continue
+            pText.typeface = sansBold; pText.textSize = 9.5f * dp
+            val w = pText.measureText(n) + 8 * dp; val r = RectF(px - w / 2, py - 7 * dp, px + w / 2, py + 7 * dp)
+            if (placed.any { RectF.intersects(it, r) }) continue
+            placed.add(r)
+            pFill.color = Color.rgb(18, 18, 18); c.drawRoundRect(r, 3 * dp, 3 * dp, pFill)
+            txt(c, n, px, py + 3.5f * dp, 9.5f * dp, Color.rgb(255, 210, 70), sansBold, Paint.Align.CENTER)
         }
-        // hold-short bars
-        for (n in gnd.hs.values) {
-            val e = n.end!!; val rh = Math.toRadians(e.hdg.toDouble())
-            val px = sx(n.x); val py = sy(n.y); val L = 9 * dp
+        // hold-short bars at real holding positions used for departures
+        for ((name, n) in gnd.hs) {
+            val e = n.end ?: continue; val rh = Math.toRadians(e.hdg.toDouble())
+            val px = sx(n.x); val py = sy(n.y); val L = 8 * dp
             val dx = sin(rh).toFloat(); val dy = -cos(rh).toFloat(); val nx = -dy; val ny = dx
             pLine.color = Color.rgb(255, 210, 60); pLine.strokeWidth = 2 * dp
             for (o in listOf(-2.5f, 2.5f)) c.drawLine(px - dx * L + nx * o * dp, py - dy * L + ny * o * dp, px + dx * L + nx * o * dp, py + dy * L + ny * o * dp, pLine)
+            if (scale * 0.1f > 10 * dp) txt(c, name, px + 10 * dp, py - 6 * dp, 9 * dp, Color.rgb(255, 210, 60), sansBold)
         }
+        // gates
+        for ((i, g) in gnd.gates.withIndex()) {
+            val occ = planes.any { it.gate == i }
+            val gx2 = sx(g.x); val gy = sy(g.y)
+            pText.typeface = sansMed; pText.textSize = 9 * dp
+            val r = max(9 * dp, pText.measureText(g.label) / 2 + 4 * dp)
+            pFill.color = if (occ) SURF2 else Color.rgb(44, 70, 96); c.drawRoundRect(gx2 - r, gy - 8 * dp, gx2 + r, gy + 8 * dp, 4 * dp, 4 * dp, pFill)
+            txt(c, g.label, gx2, gy + 3 * dp, 9 * dp, if (occ) MUTED else TXT, sansMed, Paint.Align.CENTER)
+        }
+        txt(c, "Map data © OpenStreetMap contributors (ODbL)", panelX - 10 * dp, scopeH - 8 * dp, 9 * dp, MUTED, sans, Paint.Align.RIGHT)
         pText.textAlign = Paint.Align.LEFT; pText.typeface = cond
     }
 
     fun gsLabel(p: Plane) = when (p.gs) {
-        G.GATE -> "READY PUSH"; G.TAXI -> if (p.held) "HOLD POS" else if (p.waiting) "WAITING" else "TAXI"; G.HOLD_SHORT -> "HOLD SHORT"
+        G.GATE -> "READY PUSH"; G.TAXI -> if (p.holdCross >= 0) "HOLD SHORT ${rwyName(p.holdCross)}" else if (p.held) "HOLD POS" else if (p.waiting) "WAITING" else "TAXI"; G.HOLD_SHORT -> "HOLD SHORT"
         G.LINEUP -> if (p.clearedTO) "T/O CLR" else "LUAW"; G.TAKEOFF -> "ROLLING"; G.ROLLOUT -> "ROLLOUT"; G.EXITED -> "NEED TAXI"
         G.PARKED -> "PARKED"; G.AIR -> ""
     }
     fun drawGroundPlane(c: Canvas, p: Plane, px: Float, py: Float) {
-        val needs = p.gs == G.GATE || p.gs == G.HOLD_SHORT || p.gs == G.EXITED
+        val needs = p.gs == G.GATE || p.gs == G.HOLD_SHORT || p.gs == G.EXITED || p.holdCross >= 0
         val col = when { p.conflict -> DANGER; p == sel -> Color.rgb(255, 240, 110); p.arrival -> Color.rgb(110, 255, 150); else -> Color.rgb(110, 200, 255) }
         if (needs) { pFill.color = Color.argb((90 + 70 * sin(simT * 2f)).toInt().coerceIn(0, 255), Color.red(WARN), Color.green(WARN), Color.blue(WARN)); c.drawCircle(px, py, 13 * dp, pFill) }
         pFill.color = col
@@ -798,7 +821,7 @@ class GameView(ctx: Context) : View(ctx) {
             ?: "${ap.icao} · LDG $landed · OUT $exited · HI $high"
         txt(c, sub, pill.left + 26 * dp + sw, pill.top + 27 * dp, 11.5f * dp, MUTED, sansMed)
         // icon buttons
-        val gNeed = planes.count { it.gs == G.GATE || it.gs == G.HOLD_SHORT || it.gs == G.EXITED }
+        val gNeed = planes.count { it.gs == G.GATE || it.gs == G.HOLD_SHORT || it.gs == G.EXITED || it.holdCross >= 0 }
         var bx = panelX - m - 44 * dp
         iconBtn(c, bx, m, "II", "pause"); bx -= 52 * dp
         iconBtn(c, bx, m, if (groundView) "◎" else "▦", "gnd", groundView, if (groundView) 0 else gNeed); bx -= 52 * dp
@@ -930,6 +953,10 @@ class GameView(ctx: Context) : View(ctx) {
             y += bh + gap
         }
         if (p.arrival && canTaxi) { button(c, row(1, 0), "TAXI TO GATE", "taxigate", if (p.gs == G.TAXI && p.path.isNotEmpty() && gnd.node(p.path.last()).kind == TNode.GATE) 2 else 1); y += bh + gap }
+        if (p.gs == G.TAXI && p.holdCross >= 0) {
+            val ph = p.holdCross; val bad = shortFinal(ph) || rwyOccupied(ph, p)
+            button(c, row(1, 0), "CROSS RUNWAY ${rwyName(ph)}", "cross", if (bad) 0 else 1, !bad); y += bh + gap
+        }
         if (p.gs == G.TAXI) { button(c, row(1, 0), if (p.held) "CONTINUE TAXI" else "HOLD POSITION", if (p.held) "continue" else "holdpos", if (p.held) 1 else 3); y += bh + gap }
         if (p.gs == G.HOLD_SHORT || (p.gs == G.LINEUP && !p.clearedTO)) {
             val e = p.gRwy ?: gnd.node(p.gNode).end
@@ -960,7 +987,7 @@ class GameView(ctx: Context) : View(ctx) {
         val lx = if (landscape) w * 0.3f else w / 2; val ly = if (landscape) h * 0.42f else h * 0.22f
         logo(c, lx, ly, 46 * dp)
         txt(c, "Approach Control", lx, ly + 86 * dp, 28 * dp, TXT, sansBold, Paint.Align.CENTER)
-        txt(c, "Radar ATC simulator · v0.3", lx, ly + 110 * dp, 13 * dp, MUTED, sansMed, Paint.Align.CENTER)
+        txt(c, "Radar ATC simulator · v0.4", lx, ly + 110 * dp, 13 * dp, MUTED, sansMed, Paint.Align.CENTER)
         val cw = min(320 * dp, if (landscape) w * 0.42f else w - 40 * dp)
         val x0 = if (landscape) w * 0.72f - cw / 2 else (w - cw) / 2
         var y = if (landscape) h * 0.18f else h * 0.42f
@@ -977,9 +1004,22 @@ class GameView(ctx: Context) : View(ctx) {
         menuCard("★", "Career", "Rank: ${rankName()} · ${min(career, CAREER.size)}/${CAREER.size} shifts", "tocareer", true)
         menuCard("✈", "Free play", "Pick an airport and traffic level", "toselect", false)
         menuCard("?", "Tutorial", "Learn radar, tower and ground step by step", "tutorial", false)
-        button(c, RectF(x0, y, x0 + cw, y + 44 * dp), if (radio.voice) "🔊  Voice radio on" else "🔇  Voice radio off", "voice", if (radio.voice) 2 else 0)
+        button(c, RectF(x0, y, x0 + cw * 0.62f - 4 * dp, y + 44 * dp), if (radio.voice) "🔊  Voice on" else "🔇  Voice off", "voice", if (radio.voice) 2 else 0)
+        button(c, RectF(x0 + cw * 0.62f + 4 * dp, y, x0 + cw, y + 44 * dp), "ⓘ  About", "about", 0)
     }
     fun backBtn(c: Canvas, id: String) { iconBtn(c, 14 * dp, 14 * dp, "‹", id) }
+    fun drawAbout(c: Canvas, w: Float, h: Float) {
+        scrim(c, w, h, 225); backBtn(c, "totitle")
+        txt(c, "About & credits", 70 * dp, 44 * dp, 22 * dp, TXT, sansBold)
+        val lines = listOf(
+            "Approach Control v0.4 — radar, tower & ground ATC simulator.", "",
+            "Airport layouts (runways, taxiways, aprons, terminals, gates,", "holding positions) for KATL, KJFK, KLAX and EGLL are derived from",
+            "OpenStreetMap data, © OpenStreetMap contributors, available under the", "Open Database License (ODbL) 1.0: openstreetmap.org/copyright", "",
+            "Geometry was simplified for performance and may be outdated or", "incomplete. Not for real-world navigation.", "",
+            "Fix, STAR and SID names are real or real-sounding and simplified.")
+        var y = 84 * dp
+        for (l in lines) { txt(c, l, 24 * dp, y, 13 * dp, if (l.contains("OpenStreetMap")) TXT else MUTED, sansMed); y += 19 * dp }
+    }
     fun drawSelect(c: Canvas, w: Float, h: Float) {
         scrim(c, w, h, 215); backBtn(c, "totitle")
         txt(c, "Free play", 70 * dp, 44 * dp, 22 * dp, TXT, sansBold)
@@ -1085,7 +1125,30 @@ class GameView(ctx: Context) : View(ctx) {
 
     // ---------- input ----------
     var dragging = false
+    var gDownX = 0f; var gDownY = 0f; var gLastX = 0f; var gLastY = 0f; var gMoved = false; var gScaled = false
+    val scaleDet = android.view.ScaleGestureDetector(ctx, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(d: android.view.ScaleGestureDetector): Boolean {
+            val old = scale; val nz = (gZoom * d.scaleFactor).coerceIn(0.7f, 16f); val ns = old * nz / gZoom
+            gPanX += (d.focusX - cx) / old - (d.focusX - cx) / ns
+            gPanY -= (d.focusY - cy) / old - (d.focusY - cy) / ns
+            gZoom = nz; scale = ns; gScaled = true; return true
+        }
+    })
+    fun groundTap(x: Float, y: Float) {
+        val s = sel
+                    val near = planes.filter { it.gs != G.AIR || (it.alt < 3000f) }.minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
+                    if (near != null && hypot(sx(near.x) - x, sy(near.y) - y) < 30 * dp) { if (near != sel) flushPending(); sel = near; sheetCollapsed = false; return }
+                    if (s != null && s.gs != G.AIR) {
+                        val n = (gnd.gates + gnd.hs.values).minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
+                        if (n != null && hypot(sx(n.x) - x, sy(n.y) - y) < 34 * dp) {
+                            if (n.kind == TNode.GATE && s.arrival) cmdTaxiGate(s, gnd.gates.indexOf(n))
+                            else if (n.kind == TNode.HS && !s.arrival) cmdTaxiRwy(s, n.label)
+                        }
+                    }
+                    return
+    }
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (groundView && state == S.PLAY) scaleDet.onTouchEvent(e)
         val x = e.x; val y = e.y
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -1094,18 +1157,7 @@ class GameView(ctx: Context) : View(ctx) {
                 if (state != S.PLAY) return true
                 if (sheetAnim > 0.5f && sheetRect.contains(x, y)) return true
                 val s = sel
-                if (groundView) {
-                    val near = planes.filter { it.gs != G.AIR || (it.alt < 3000f) }.minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
-                    if (near != null && hypot(sx(near.x) - x, sy(near.y) - y) < 30 * dp) { if (near != sel) flushPending(); sel = near; sheetCollapsed = false; return true }
-                    if (s != null && s.gs != G.AIR) {
-                        val n = (gnd.gates + gnd.hs.values).minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
-                        if (n != null && hypot(sx(n.x) - x, sy(n.y) - y) < 34 * dp) {
-                            if (n.kind == TNode.GATE && s.arrival) cmdTaxiGate(s, gnd.gates.indexOf(n))
-                            else if (n.kind == TNode.HS && !s.arrival) cmdTaxiRwy(s, n.label)
-                        }
-                    }
-                    return true
-                }
+                if (groundView) { gDownX = x; gDownY = y; gLastX = x; gLastY = y; gMoved = false; gScaled = false; return true }
                 if (pick != null && s != null) {
                     val f = (ap.fixes + sids.values.map { it.fixes[0] }).minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
                     if (f != null && hypot(sx(f.x) - x, sy(f.y) - y) < 45 * dp) {
@@ -1123,14 +1175,22 @@ class GameView(ctx: Context) : View(ctx) {
                 val near = planes.filter { it.gs == G.AIR }.minByOrNull { hypot(sx(it.x) - x, sy(it.y) - y) }
                 if (near != null && hypot(sx(near.x) - x, sy(near.y) - y) < 45 * dp) { if (near != sel) flushPending(); sel = near; sheetCollapsed = false }
             }
-            MotionEvent.ACTION_MOVE -> if (dragging) sel?.let { p ->
+            MotionEvent.ACTION_MOVE -> if (groundView && state == S.PLAY) {
+                if (!scaleDet.isInProgress && e.pointerCount == 1) {
+                    if (hypot(x - gDownX, y - gDownY) > 10 * dp) gMoved = true
+                    if (gMoved) { gPanX -= (x - gLastX) / scale; gPanY += (y - gLastY) / scale }
+                }
+                gLastX = x; gLastY = y
+            } else if (dragging) sel?.let { p ->
                 val px = sx(p.x); val py = sy(p.y)
                 if (hypot(x - px, y - py) > 22 * dp) {
                     val b = norm(Math.toDegrees(atan2((x - px).toDouble(), (py - y).toDouble())).toFloat())
                     setHeading(p, norm((b / 5f).roundToInt() * 5f))
                 }
             }
-            MotionEvent.ACTION_UP -> dragging = false
+            MotionEvent.ACTION_UP -> { dragging = false
+                if (groundView && state == S.PLAY && !gMoved && !gScaled && !(sheetAnim > 0.5f && sheetRect.contains(x, y)) && btns.none { it.first.contains(x, y) }) groundTap(x, y) }
+            MotionEvent.ACTION_POINTER_DOWN -> { gScaled = true; gLastX = x; gLastY = y }
         }
         return true
     }
@@ -1150,15 +1210,19 @@ class GameView(ctx: Context) : View(ctx) {
         if (p.gs == G.HOLD_SHORT) p.gs = G.TAXI.also { }
         val names = taxiTo(p, n) ?: run { flash("No taxi route"); return }
         if (wasGate) p.hdg = norm(p.hdg + 180f)
-        val via = if (names.isEmpty()) "" else " via ${names.joinToString(", ")}"
+        val via = (if (names.isEmpty()) "" else " via ${names.joinToString(", ")}") + crossNote(p)
         gcall(p, (if (wasGate) "push back approved, " else "") + "taxi to runway $end$via, hold short of runway $end", "Taxi runway $end$via, hold short")
+    }
+    fun crossNote(p: Plane): String {
+        val xr = p.path.map { gnd.node(it).phys }.firstOrNull { it >= 0 && it != p.crossing && it !in p.crossOk } ?: return ""
+        return ", hold short of runway ${rwyName(xr)}"
     }
     fun cmdTaxiGate(p: Plane, want: Int = -1) {
         val free = freeGates().toMutableList(); if (p.gate >= 0) free.add(p.gate)
         val gi = if (want >= 0 && want in free) want else free.minByOrNull { hypot(gnd.gates[it].x - p.x, gnd.gates[it].y - p.y) } ?: run { flash("No free gates"); return }
         p.gate = gi
         val names = taxiTo(p, gnd.gates[gi]) ?: run { flash("No taxi route"); return }
-        val via = if (names.isEmpty()) "" else " via ${names.joinToString(", ")}"
+        val via = (if (names.isEmpty()) "" else " via ${names.joinToString(", ")}") + crossNote(p)
         gcall(p, "taxi to gate ${gi + 1}$via", "Gate ${gi + 1}$via")
     }
 
@@ -1171,11 +1235,12 @@ class GameView(ctx: Context) : View(ctx) {
             id.startsWith("traffic:") -> { val i = id.substring(8).toInt(); if (i < 2 || career >= 5) trafficIdx = i; return }
             id.startsWith("ap:") -> { start(AIRPORTS[id.substring(3).toInt()], M.FREE); return }
             id.startsWith("career:") -> { val lv = CAREER[id.substring(7).toInt()]; start(AIRPORTS.first { it.icao == lv.icao }, M.CAREER, lv); return }
-            id == "again" -> { start(ap, mode, level); return }
+            id == "again" -> { gZoom = 1f; gPanX = 0f; gPanY = 0f; start(ap, mode, level); return }
             id == "pause" -> { state = S.PAUSE; radio.stop(); return }
             id == "resume" -> { state = S.PLAY; lastFrame = 0L; return }
             id == "voice" -> { radio.voice = !radio.voice; if (!radio.voice) radio.stop(); prefs.edit().putBoolean("voice", radio.voice).apply(); return }
-            id == "gnd" -> { groundView = !groundView; pick = null; return }
+            id == "gnd" -> { groundView = !groundView; pick = null; gZoom = 1f; gPanX = 0f; gPanY = 0f; return }
+            id == "about" -> { state = S.ABOUT; return }
             id == "sheet" -> { sheetCollapsed = !sheetCollapsed; return }
             id == "quit" -> { if (score > high && mode != M.TUTORIAL) { high = score; prefs.edit().putInt(hiKey(), high).apply() }; radio.stop(); state = S.TITLE; return }
         }
@@ -1206,6 +1271,13 @@ class GameView(ctx: Context) : View(ctx) {
             }
             id.startsWith("taxi:") -> cmdTaxiRwy(p, id.substring(5))
             id == "taxigate" -> cmdTaxiGate(p)
+            id == "cross" -> {
+                val ph = p.holdCross.takeIf { it >= 0 } ?: p.path.map { gnd.node(it).phys }.firstOrNull { it >= 0 && it !in p.crossOk } ?: return
+                if (shortFinal(ph)) { flash("UNABLE: traffic on short final"); return }
+                if (rwyOccupied(ph, p)) { flash("UNABLE: runway ${rwyName(ph)} occupied"); return }
+                p.crossOk.add(ph); p.holdCross = -1
+                gcall(p, "cross runway ${rwyName(ph)}", "Cross runway ${rwyName(ph)}")
+            }
             id == "holdpos" -> { p.held = true; gcall(p, "hold position", "Holding position") }
             id == "continue" -> { p.held = false; gcall(p, "continue taxi", "Continuing") }
             id == "luaw" -> {
